@@ -3,11 +3,22 @@ import re
 import time
 import os
 os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-logging --log-level=3")
+import mimetypes
 import json
 import random
+import smtplib
 import socket
+import ssl
 import datetime
+import html
 import uuid
+import copy
+import platform
+import getpass
+import ipaddress
+from contextlib import contextmanager
+from functools import lru_cache
+from email.message import EmailMessage
 from cryptography.fernet import Fernet
 from PyQt6.QtCore import *
 from PyQt6.QtWidgets import *
@@ -23,7 +34,7 @@ from urllib.parse import urlparse
 from PyQt6.QtGui import (
     QIcon, QAction, QPixmap, QKeySequence,
     QStandardItemModel, QStandardItem,
-    QBrush, QColor, QPainter, QPen, QFont, QPalette, QLinearGradient
+    QBrush, QColor, QPainter, QPen, QFont, QPalette, QLinearGradient, QPolygonF, QCursor
 )
 from PyQt6.QtNetwork import (
     QNetworkProxy,
@@ -31,6 +42,7 @@ from PyQt6.QtNetwork import (
     QNetworkAccessManager,
     QNetworkRequest
 )
+from PyQt6.QtTest import QTest
 import urllib.parse
 from PyQt6.QtCore import QTimer
 import pandas as pd
@@ -50,6 +62,25 @@ ATTENDANCE_IDLE_THRESHOLD_SECONDS = 5 * 60
 ATTENDANCE_TOUCH_DEBOUNCE_SECONDS = 12
 MAX_ATTENDANCE_SEGMENTS = 1200
 MAX_BULK_RECIPIENTS = 20
+QC_NOTIFICATION_MAX_EMAILS = 5
+QC_NOTIFICATION_MAX_WHATSAPP = 5
+QC_WHATSAPP_BORROW_IDLE_SECONDS = 15
+QC_EMAIL_BATCH_SIZE = 20
+QC_EMAIL_BATCH_MAX_WAIT_SECONDS = 3 * 60 * 60
+QC_EMAIL_BATCH_IDLE_POLL_MS = 60 * 1000
+LOCAL_DATA_RETENTION_DAYS = 15
+QC_WHATSAPP_ORPHAN_FILE_GRACE_SECONDS = 10 * 60
+STORAGE_MAINTENANCE_INTERVAL_MS = 3 * 60 * 60 * 1000
+QC_EMAIL_FROM_NAME = "Locked Browser System"
+QC_EMAIL_HOST = "smtp.exmail.qq.com"
+QC_EMAIL_PORT = 465
+QC_EMAIL_SECURE = True
+QC_EMAIL_USER = "it@pendanaan.com"
+QC_EMAIL_PASS = "KTAKilatsukses2025"
+EMAIL_ADDRESS_RE = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.IGNORECASE)
+
+_ENCRYPTED_FILE_CACHE = {}
+_BAD_WORDS_CACHE = {"path": "", "stamp": None, "words": []}
 
 
 def get_runtime_resource_dir():
@@ -61,6 +92,26 @@ def get_runtime_resource_dir():
         return os.path.dirname(os.path.abspath(sys.executable))
 
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_file_cache_stamp(path):
+    try:
+        stat = os.stat(path)
+        return (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return None
+
+
+def clone_list_of_dicts(value):
+    return [dict(item) if isinstance(item, dict) else item for item in list(value or [])]
+
+
+def clone_string_list(value):
+    return [str(item) for item in list(value or [])]
+
+
+def clone_nested_data(value):
+    return copy.deepcopy(value)
 
 def detect_user_timezone_info():
     try:
@@ -80,6 +131,96 @@ def detect_user_timezone_info():
     return datetime.timezone(datetime.timedelta(hours=7)), FALLBACK_TIMEZONE_NAME
 
 USER_TIMEZONE, USER_TIMEZONE_NAME = detect_user_timezone_info()
+
+
+def get_system_local_datetime():
+    try:
+        return datetime.datetime.now().astimezone()
+    except Exception:
+        return datetime.datetime.now(USER_TIMEZONE)
+
+
+def format_system_local_timestamp(dt=None):
+    if dt is None:
+        dt = get_system_local_datetime()
+
+    if isinstance(dt, datetime.datetime):
+        if dt.tzinfo is None:
+            try:
+                dt = dt.astimezone()
+            except Exception:
+                pass
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    return str(dt or "").strip()
+
+
+def format_mac_address(raw_value):
+    try:
+        numeric = int(raw_value or 0)
+    except Exception:
+        numeric = 0
+
+    if numeric <= 0:
+        return ""
+
+    parts = [f"{(numeric >> shift) & 0xFF:02x}" for shift in range(40, -1, -8)]
+    text = ":".join(parts)
+    return "" if text == "00:00:00:00:00:00" else text
+
+
+def is_private_ipv4_text(value):
+    try:
+        addr = ipaddress.ip_address(str(value or "").strip())
+    except Exception:
+        return False
+
+    return bool(
+        getattr(addr, "version", 0) == 4
+        and addr.is_private
+        and not addr.is_loopback
+        and not addr.is_link_local
+    )
+
+
+def detect_local_private_ipv4_addresses(limit=16):
+    found = set()
+
+    def add_ip(value):
+        if is_private_ipv4_text(value):
+            found.add(str(ipaddress.ip_address(str(value).strip())))
+
+    try:
+        hostname = socket.gethostname()
+        for _, _, _, _, sockaddr in socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM):
+            if sockaddr:
+                add_ip(sockaddr[0])
+    except Exception:
+        pass
+
+    try:
+        _, _, host_list = socket.gethostbyname_ex(socket.gethostname())
+        for value in host_list:
+            add_ip(value)
+    except Exception:
+        pass
+
+    for probe_host in ("1.1.1.1", "8.8.8.8"):
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.connect((probe_host, 80))
+            add_ip(sock.getsockname()[0])
+        except Exception:
+            pass
+        finally:
+            try:
+                if sock is not None:
+                    sock.close()
+            except Exception:
+                pass
+
+    return sorted(found)[: max(1, int(limit or 1))]
 
 NEW_TAB_ENABLED_GROUPS = {"Google", "Tencent", "Pendanaan"}
 
@@ -136,6 +277,7 @@ os.makedirs(BASE_DIR, exist_ok=True)
 
 H_DIR = os.path.join(BASE_DIR, "h")
 os.makedirs(H_DIR, exist_ok=True)
+QC_WHATSAPP_TEMP_DIR = os.path.join(H_DIR, "qc_whatsapp")
 
 RUN_DIR = get_runtime_resource_dir()
 DEFAULT_BAD_WORDS_FILE = os.path.join(RUN_DIR, "bw.txt")
@@ -168,9 +310,81 @@ LAST_BLAST_FILE = None
 MANUAL_SEND_LOG_FILE = None
 
 APP_STATE_FILE = os.path.join(H_DIR, "s.dat")
+PROXY_STATE_FILE = os.path.join(H_DIR, "proxy.dat")
 PROFILE_BASE_DIR = os.path.join(BASE_DIR, "profiles")
 
-ALLOWED_DOWNLOAD_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.mp3', '.mp4', '.pdf'}
+ALLOWED_DOWNLOAD_EXTENSIONS = {
+    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.heic',
+    '.mp3', '.mp4', '.m4a', '.aac', '.ogg', '.oga', '.opus', '.wav', '.amr',
+    '.mov', '.m4v', '.webm', '.3gp', '.avi', '.mkv',
+    '.pdf', '.txt', '.csv', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.rtf',
+    '.zip', '.rar', '.7z'
+}
+ALLOWED_DOWNLOAD_MIME_PREFIXES = ("image/", "video/", "audio/")
+ALLOWED_DOWNLOAD_MIME_TYPES = {
+    "application/pdf",
+    "text/plain",
+    "text/csv",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/rtf",
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/vnd.rar",
+    "application/x-rar-compressed",
+    "application/x-7z-compressed",
+}
+DOWNLOAD_MIME_EXTENSION_MAP = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/heic": ".heic",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/aac": ".aac",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/wav": ".wav",
+    "audio/amr": ".amr",
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/webm": ".webm",
+    "video/3gpp": ".3gp",
+    "video/x-msvideo": ".avi",
+    "video/x-matroska": ".mkv",
+    "application/pdf": ".pdf",
+    "text/plain": ".txt",
+    "text/csv": ".csv",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.ms-powerpoint": ".ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "application/rtf": ".rtf",
+    "application/zip": ".zip",
+    "application/x-zip-compressed": ".zip",
+    "application/vnd.rar": ".rar",
+    "application/x-rar-compressed": ".rar",
+    "application/x-7z-compressed": ".7z",
+}
+
+
+def build_default_proxy_info():
+    return {
+        "enabled": False,
+        "type": "DIRECT",
+        "host": "",
+        "port": 0,
+        "username": "",
+        "password": ""
+    }
 
 SPOOF_COUNTRIES = {
     "Singapore": (1.3521, 103.8198),
@@ -180,8 +394,9 @@ SPOOF_COUNTRIES = {
     "Australia": (-25.2744, 133.7751)
 }
 
-def normalize_chat_key(raw):
-    s = str(raw or "").strip()
+@lru_cache(maxsize=8192)
+def _normalize_chat_key_cached(text):
+    s = str(text or "").strip()
     if not s:
         return ""
 
@@ -197,6 +412,10 @@ def normalize_chat_key(raw):
             return digits
 
     return s.lower()
+
+
+def normalize_chat_key(raw):
+    return _normalize_chat_key_cached(str(raw or ""))
 
 
 WHATSAPP_OUTGOING_SEND_TYPES = {"manual", "bulk_auto", "sync_outgoing"}
@@ -237,6 +456,77 @@ def format_history_endpoint(phone_value="", label_value="", fallback="-"):
     if label_text:
         return label_text
     return fallback
+
+
+@lru_cache(maxsize=4096)
+def _normalize_whatsapp_contact_alias_cached(text):
+    text = re.sub(r"\s+", " ", str(text or "").strip())
+    if not text:
+        return ""
+
+    match = re.match(r"^(?:\+?\d[\d\s().-]{6,})\s*\((.+)\)$", text)
+    if match:
+        text = match.group(1).strip()
+
+    return text.lower()
+
+
+def normalize_whatsapp_contact_alias(raw):
+    return _normalize_whatsapp_contact_alias_cached(str(raw or ""))
+
+
+WHATSAPP_SYNC_INVALID_LABELS = {
+    "",
+    "profile",
+    "profile details",
+    "contact info",
+    "group info",
+    "click here for contact info",
+    "click for contact info",
+    "click here for group info",
+    "typing...",
+    "new chat",
+    "business account",
+    "official whatsapp account",
+    "whatsapp",
+}
+
+
+def is_whatsapp_time_only_text(value):
+    text = str(value or "").strip().lower()
+    if not text:
+        return True
+    if re.fullmatch(r"\d{1,2}[:.]\d{2}(?::\d{2})?\s*(am|pm)?", text, flags=re.IGNORECASE):
+        return True
+    if text in {"today", "yesterday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}:
+        return True
+    return False
+
+
+def is_invalid_whatsapp_sync_history_entry(entry):
+    if not isinstance(entry, dict):
+        return False
+
+    send_type = str(entry.get("send_type") or "").strip().lower()
+    if send_type not in {"sync_incoming", "sync_outgoing"}:
+        return False
+
+    phone = normalize_chat_key(entry.get("from_phone") or entry.get("to_phone"))
+    if phone:
+        return False
+
+    labels = [
+        str(entry.get("chat_label") or "").strip().lower(),
+        str(entry.get("from_display") or "").strip().lower(),
+        str(entry.get("from") or "").strip().lower(),
+        str(entry.get("to") or "").strip().lower(),
+        str(entry.get("conversation_key") or "").strip().lower(),
+    ]
+    for label in labels:
+        if label in WHATSAPP_SYNC_INVALID_LABELS:
+            return True
+
+    return False
 
 
 def normalize_whatsapp_history_entry(item, bad_words=None):
@@ -281,6 +571,7 @@ def normalize_whatsapp_history_entry(item, bad_words=None):
             or ""
         ).strip()
         from_display = str(entry.get("from_display") or chat_label or from_phone or "Customer").strip()
+        account_label = str(entry.get("to") or entry.get("account_label") or "").strip()
         conversation_key = normalize_chat_key(
             entry.get("conversation_key") or from_phone or chat_label or from_display
         )
@@ -290,12 +581,16 @@ def normalize_whatsapp_history_entry(item, bad_words=None):
             entry["from"] = from_phone
         entry["chat_label"] = chat_label
         entry["from_display"] = from_display
+        if account_label:
+            entry["to"] = account_label
+        entry["account_label"] = account_label
         entry["conversation_key"] = conversation_key
         entry["status"] = "received"
 
     elif direction == "outgoing":
         to_phone = normalize_chat_key(entry.get("to_phone") or entry.get("to"))
         to_label = str(entry.get("chat_label") or entry.get("to") or "").strip()
+        account_label = str(entry.get("from") or entry.get("account_label") or "").strip()
         conversation_key = normalize_chat_key(
             entry.get("conversation_key") or to_phone or to_label
         )
@@ -303,6 +598,9 @@ def normalize_whatsapp_history_entry(item, bad_words=None):
         entry["to_phone"] = to_phone or ""
         if not str(entry.get("to") or "").strip():
             entry["to"] = to_phone or to_label
+        if account_label:
+            entry["from"] = account_label
+        entry["account_label"] = account_label
         entry["chat_label"] = to_label
         entry["conversation_key"] = conversation_key
         if str(entry.get("status") or "").strip().lower() not in {"sent", "failed"}:
@@ -323,6 +621,9 @@ def repair_whatsapp_history_log_entries(log_entries, bad_words=None):
 
     for item in list(log_entries or []):
         fixed_item, item_changed = normalize_whatsapp_history_entry(item, bad_words=bad_words)
+        if is_invalid_whatsapp_sync_history_entry(fixed_item):
+            changed = True
+            continue
         repaired.append(fixed_item)
         if item_changed:
             changed = True
@@ -393,17 +694,17 @@ def build_whatsapp_history_rows(log_entries):
         if direction == "incoming":
             contact_phone = normalize_chat_key(item.get("from_phone") or item.get("from"))
             contact_label = str(item.get("from_display") or chat_label or item.get("from") or "").strip()
-            self_account = str(item.get("to") or "").strip()
+            self_account = str(item.get("to") or item.get("account_label") or "").strip()
             from_text = format_history_endpoint(contact_phone, contact_label)
             to_text = self_account or "-"
         else:
             contact_phone = normalize_chat_key(item.get("to_phone") or item.get("to"))
             contact_label = str(chat_label or item.get("to") or "").strip()
-            self_account = str(item.get("from") or "").strip()
+            self_account = str(item.get("from") or item.get("account_label") or "").strip()
             from_text = self_account or "-"
             to_text = format_history_endpoint(contact_phone, contact_label)
 
-        contact_key = normalize_chat_key(conversation_key or contact_phone or contact_label)
+        contact_key = normalize_chat_key(contact_phone or conversation_key or contact_label)
         contact_display = format_history_endpoint(contact_phone, contact_label, fallback=contact_key or "-")
 
         rows.append({
@@ -440,11 +741,25 @@ def build_whatsapp_history_rows(log_entries):
 
 def build_whatsapp_conversation_summaries(rows):
     buckets = {}
+    alias_to_bucket = {}
 
     for row in list(rows or []):
         if not isinstance(row, dict):
             continue
-        key = str(row.get("contact_key") or "").strip()
+        raw_key = str(row.get("contact_key") or "").strip()
+        phone_key = normalize_chat_key(row.get("contact_phone"))
+        alias_key = normalize_whatsapp_contact_alias(
+            row.get("contact_display") or row.get("contact_key") or ""
+        )
+
+        key = ""
+        if phone_key and phone_key in buckets:
+            key = phone_key
+        elif alias_key and alias_key in alias_to_bucket:
+            key = alias_to_bucket[alias_key]
+        else:
+            key = phone_key or raw_key or alias_key
+
         if not key:
             continue
 
@@ -461,6 +776,24 @@ def build_whatsapp_conversation_summaries(rows):
             "last_preview": row.get("preview") or "",
             "rows": []
         })
+
+        if alias_key:
+            alias_to_bucket[alias_key] = key
+
+        if phone_key and not bucket.get("contact_phone"):
+            bucket["contact_phone"] = phone_key
+
+        current_display = str(bucket.get("contact_display") or "").strip()
+        incoming_display = str(row.get("contact_display") or "").strip()
+        if incoming_display:
+            if not current_display:
+                bucket["contact_display"] = incoming_display
+            elif current_display == key and incoming_display != key:
+                bucket["contact_display"] = incoming_display
+            elif phone_key and normalize_chat_key(current_display) == phone_key and normalize_chat_key(incoming_display) != phone_key:
+                bucket["contact_display"] = incoming_display
+            elif "(" not in current_display and "(" in incoming_display:
+                bucket["contact_display"] = incoming_display
 
         bucket["rows"].append(row)
         bucket["total_count"] += 1
@@ -486,6 +819,163 @@ def build_whatsapp_conversation_summaries(rows):
 
     summaries.sort(key=lambda bucket: history_timestamp_sort_key(bucket.get("last_timestamp")), reverse=True)
     return summaries
+
+
+def filter_whatsapp_history_rows_by_account(rows, account_filter=""):
+    account_text = normalize_whatsapp_history_account_key(account_filter)
+    if not account_text:
+        return list(rows or [])
+
+    filtered = []
+    for row in list(rows or []):
+        if not isinstance(row, dict):
+            continue
+        self_account = normalize_whatsapp_history_account_key(row.get("self_account"))
+        if account_text in self_account:
+            filtered.append(row)
+    return filtered
+
+
+def summary_matches_whatsapp_query(summary, query_text=""):
+    query_raw = str(query_text or "").strip()
+    if not query_raw:
+        return True
+
+    query_lower = query_raw.lower()
+    query_key = normalize_chat_key(query_raw)
+    query_alias = normalize_whatsapp_contact_alias(query_raw)
+
+    contact_key = normalize_chat_key(summary.get("contact_key"))
+    contact_phone = normalize_chat_key(summary.get("contact_phone"))
+    contact_display = str(summary.get("contact_display") or "").strip()
+    account_text = str(summary.get("self_accounts_text") or "").strip()
+    last_preview = str(summary.get("last_preview") or "").strip()
+
+    if query_key and query_key in {contact_key, contact_phone}:
+        return True
+
+    if query_alias and normalize_whatsapp_contact_alias(contact_display) == query_alias:
+        return True
+
+    haystacks = [
+        contact_display.lower(),
+        str(summary.get("contact_key") or "").lower(),
+        str(summary.get("contact_phone") or "").lower(),
+        account_text.lower(),
+        last_preview.lower()
+    ]
+    return any(query_lower in hay for hay in haystacks if hay)
+
+
+def get_qc_api_conversation_rows(account_filter=""):
+    logs, _ = repair_whatsapp_history_log_entries(
+        load_manual_send_log(),
+        bad_words=load_bad_words()
+    )
+    rows = build_whatsapp_history_rows(logs)
+    return filter_whatsapp_history_rows_by_account(rows, account_filter=account_filter)
+
+
+def build_qc_api_conversation_summaries(account_filter="", search_text=""):
+    summaries = build_whatsapp_conversation_summaries(
+        get_qc_api_conversation_rows(account_filter=account_filter)
+    )
+
+    if search_text:
+        summaries = [summary for summary in summaries if summary_matches_whatsapp_query(summary, search_text)]
+
+    items = []
+    for summary in summaries:
+        items.append({
+            "contact_key": summary.get("contact_key") or "",
+            "contact_display": summary.get("contact_display") or "",
+            "contact_phone": summary.get("contact_phone") or "",
+            "self_accounts": sorted(summary.get("self_accounts") or []),
+            "self_accounts_text": summary.get("self_accounts_text") or "",
+            "sent_count": int(summary.get("sent_count") or 0),
+            "received_count": int(summary.get("received_count") or 0),
+            "total_count": int(summary.get("total_count") or 0),
+            "first_message_at": format_user_datetime_text(summary.get("first_timestamp"), default="-"),
+            "last_message_at": format_user_datetime_text(summary.get("last_timestamp"), default="-"),
+            "last_preview": summary.get("last_preview") or ""
+        })
+
+    return items
+
+
+def build_qc_api_conversation_messages(contact_query, account_filter=""):
+    query_text = str(contact_query or "").strip()
+    if not query_text:
+        return None, []
+
+    summaries = build_whatsapp_conversation_summaries(
+        get_qc_api_conversation_rows(account_filter=account_filter)
+    )
+
+    exact_key = normalize_chat_key(query_text)
+    exact_alias = normalize_whatsapp_contact_alias(query_text)
+
+    selected = None
+    for summary in summaries:
+        contact_key = normalize_chat_key(summary.get("contact_key"))
+        contact_phone = normalize_chat_key(summary.get("contact_phone"))
+        contact_alias = normalize_whatsapp_contact_alias(summary.get("contact_display"))
+        if exact_key and exact_key in {contact_key, contact_phone}:
+            selected = summary
+            break
+        if exact_alias and exact_alias and exact_alias == contact_alias:
+            selected = summary
+            break
+
+    if selected is None:
+        for summary in summaries:
+            if summary_matches_whatsapp_query(summary, query_text):
+                selected = summary
+                break
+
+    if selected is None:
+        return None, []
+
+    items = []
+    for row in list(selected.get("rows") or []):
+        items.append({
+            "timestamp": row.get("timestamp") or "",
+            "timestamp_display": row.get("timestamp_display") or "-",
+            "direction": row.get("direction") or "",
+            "send_type": row.get("send_type") or "",
+            "status": row.get("status") or "",
+            "self_account": row.get("self_account") or "",
+            "from": row.get("from_text") or "",
+            "to": row.get("to_text") or "",
+            "content": row.get("content") or "",
+            "preview": row.get("preview") or "",
+            "has_attachment": bool(row.get("has_attachment")),
+            "trigger": row.get("trigger") or "",
+            "message_length": int(row.get("message_length") or 0),
+            "bad_word_count": int(row.get("bad_word_count") or 0),
+            "bad_words": list(row.get("bad_words") or []),
+            "reply_speed_hms": row.get("reply_speed_hms") or "",
+            "message_author": row.get("message_author") or "",
+            "contact_key": row.get("contact_key") or "",
+            "contact_display": row.get("contact_display") or "",
+            "contact_phone": row.get("contact_phone") or "",
+            "conversation_key": row.get("conversation_key") or ""
+        })
+
+    summary_payload = {
+        "contact_key": selected.get("contact_key") or "",
+        "contact_display": selected.get("contact_display") or "",
+        "contact_phone": selected.get("contact_phone") or "",
+        "self_accounts": sorted(selected.get("self_accounts") or []),
+        "self_accounts_text": selected.get("self_accounts_text") or "",
+        "sent_count": int(selected.get("sent_count") or 0),
+        "received_count": int(selected.get("received_count") or 0),
+        "total_count": int(selected.get("total_count") or 0),
+        "first_message_at": format_user_datetime_text(selected.get("first_timestamp"), default="-"),
+        "last_message_at": format_user_datetime_text(selected.get("last_timestamp"), default="-"),
+        "last_preview": selected.get("last_preview") or ""
+    }
+    return summary_payload, items
 
 
 def build_whatsapp_history_detail_text(row):
@@ -645,6 +1135,55 @@ def format_user_datetime_text(value, default="", include_tz=False):
     return text
 
 
+def get_local_retention_cutoff_utc(days=LOCAL_DATA_RETENTION_DAYS):
+    try:
+        days_value = max(1, int(days or LOCAL_DATA_RETENTION_DAYS))
+    except Exception:
+        days_value = LOCAL_DATA_RETENTION_DAYS
+    return get_system_local_datetime().astimezone(datetime.timezone.utc) - datetime.timedelta(days=days_value)
+
+
+def prune_items_older_than(items, timestamp_keys=("timestamp", "ts"), days=LOCAL_DATA_RETENTION_DAYS):
+    cutoff_utc = get_local_retention_cutoff_utc(days=days)
+    kept = []
+    removed = 0
+
+    for item in list(items or []):
+        if not isinstance(item, dict):
+            kept.append(item)
+            continue
+
+        item_dt = None
+        for key in timestamp_keys:
+            item_dt = parse_iso_dt(item.get(key))
+            if item_dt is not None:
+                break
+
+        if item_dt is not None and item_dt <= cutoff_utc:
+            removed += 1
+            continue
+
+        kept.append(item)
+
+    return kept, removed
+
+
+def prune_day_map_older_than(day_map, days=LOCAL_DATA_RETENTION_DAYS):
+    cutoff_utc = get_local_retention_cutoff_utc(days=days)
+    cutoff_day = cutoff_utc.astimezone(USER_TIMEZONE).date()
+    kept = {}
+    removed = 0
+
+    for day_key, bucket in dict(day_map or {}).items():
+        day_obj = parse_ymd_date(day_key)
+        if day_obj is not None and day_obj <= cutoff_day:
+            removed += 1
+            continue
+        kept[str(day_key)] = bucket
+
+    return kept, removed
+
+
 def make_timestamps_display_friendly(value):
     if isinstance(value, list):
         return [make_timestamps_display_friendly(x) for x in value]
@@ -663,8 +1202,9 @@ def make_timestamps_display_friendly(value):
 
     return value
 
-def normalize_indonesia_mobile(raw):
-    digits = "".join(ch for ch in str(raw or "") if ch.isdigit())
+@lru_cache(maxsize=8192)
+def _normalize_indonesia_mobile_cached(text):
+    digits = "".join(ch for ch in str(text or "") if ch.isdigit())
     if not digits:
         return None, None
 
@@ -696,6 +1236,10 @@ def normalize_indonesia_mobile(raw):
 
     display_number = "+62 " + "-".join(parts)
     return send_number, display_number
+
+
+def normalize_indonesia_mobile(raw):
+    return _normalize_indonesia_mobile_cached(str(raw or ""))
 
 
 def extract_uid_mobile_pairs(payload):
@@ -921,6 +1465,100 @@ def configure_scrollable_text_edit(edit, min_height=None, always_show_scroll=Fal
     return edit
 
 
+def get_available_screen_geometry(widget=None):
+    screen = None
+
+    if isinstance(widget, QWidget):
+        try:
+            screen = widget.screen()
+        except Exception:
+            screen = None
+
+        if screen is None:
+            try:
+                handle = widget.windowHandle()
+            except Exception:
+                handle = None
+            if handle is not None:
+                try:
+                    screen = handle.screen()
+                except Exception:
+                    screen = None
+
+    app = QApplication.instance()
+    if screen is None and app is not None:
+        try:
+            screen = app.screenAt(QCursor.pos())
+        except Exception:
+            screen = None
+
+    if screen is None:
+        try:
+            screen = QApplication.primaryScreen()
+        except Exception:
+            screen = None
+
+    if screen is not None:
+        try:
+            geometry = screen.availableGeometry()
+            if geometry.width() > 0 and geometry.height() > 0:
+                return geometry
+        except Exception:
+            pass
+
+    return QRect(0, 0, 1366, 768)
+
+
+def center_widget_on_available_screen(widget, geometry=None):
+    if not isinstance(widget, QWidget):
+        return
+
+    geometry = geometry or get_available_screen_geometry(widget)
+    frame = widget.frameGeometry()
+    x = geometry.x() + max(0, int((geometry.width() - frame.width()) / 2))
+    y = geometry.y() + max(0, int((geometry.height() - frame.height()) / 2))
+    widget.move(x, y)
+
+
+def apply_screen_friendly_window_size(
+    widget,
+    preferred_width,
+    preferred_height,
+    *,
+    min_width=560,
+    min_height=420,
+    width_ratio=0.92,
+    height_ratio=0.90,
+    center=True
+):
+    if not isinstance(widget, QWidget):
+        return QSize(int(preferred_width or 0), int(preferred_height or 0))
+
+    geometry = get_available_screen_geometry(widget)
+    available_width = max(360, int(geometry.width() or 0))
+    available_height = max(280, int(geometry.height() or 0))
+
+    max_width = max(320, min(available_width, int(available_width * float(width_ratio))))
+    max_height = max(260, min(available_height, int(available_height * float(height_ratio))))
+
+    max_min_width = max(280, min(available_width, int(available_width * 0.78)))
+    max_min_height = max(240, min(available_height, int(available_height * 0.78)))
+
+    bounded_min_width = min(max(320, int(min_width)), max_min_width, max_width)
+    bounded_min_height = min(max(260, int(min_height)), max_min_height, max_height)
+
+    target_width = max(bounded_min_width, min(int(preferred_width), max_width))
+    target_height = max(bounded_min_height, min(int(preferred_height), max_height))
+
+    widget.setMinimumSize(bounded_min_width, bounded_min_height)
+    widget.resize(target_width, target_height)
+
+    if center:
+        center_widget_on_available_screen(widget, geometry)
+
+    return QSize(target_width, target_height)
+
+
 def apply_ios_button_shadow(button):
     if not isinstance(button, (QPushButton, QToolButton)):
         return
@@ -997,6 +1635,76 @@ def select_first_table_row(table):
         return
     table.setCurrentCell(0, 0)
     table.selectRow(0)
+
+
+@contextmanager
+def table_update_batch(table):
+    if not isinstance(table, QTableWidget):
+        yield table
+        return
+
+    try:
+        previous_updates_enabled = table.updatesEnabled()
+    except Exception:
+        previous_updates_enabled = True
+
+    try:
+        previous_signals_blocked = table.blockSignals(True)
+    except Exception:
+        previous_signals_blocked = False
+
+    try:
+        previous_sorting_enabled = table.isSortingEnabled()
+    except Exception:
+        previous_sorting_enabled = False
+
+    viewport = None
+    try:
+        viewport = table.viewport()
+    except Exception:
+        viewport = None
+
+    try:
+        if previous_sorting_enabled:
+            table.setSortingEnabled(False)
+    except Exception:
+        pass
+
+    try:
+        table.setUpdatesEnabled(False)
+    except Exception:
+        pass
+
+    if viewport is not None:
+        try:
+            viewport.setUpdatesEnabled(False)
+        except Exception:
+            pass
+
+    try:
+        yield table
+    finally:
+        if viewport is not None:
+            try:
+                viewport.setUpdatesEnabled(True)
+            except Exception:
+                pass
+
+        try:
+            table.setUpdatesEnabled(previous_updates_enabled)
+        except Exception:
+            pass
+
+        try:
+            table.blockSignals(previous_signals_blocked)
+        except Exception:
+            pass
+
+        if previous_sorting_enabled:
+            try:
+                table.setSortingEnabled(True)
+            except Exception:
+                pass
 
 
 def configure_data_table_widget(table, stretch_last=False):
@@ -1504,8 +2212,13 @@ def dedupe_bulk_recipients(items):
     return [unique_map[k] for k in ordered_keys], duplicate_count
 
 
+@lru_cache(maxsize=8192)
+def _normalize_name_key_cached(text):
+    return re.sub(r"\s+", " ", str(text or "").strip()).lower()
+
+
 def normalize_name_key(value):
-    return re.sub(r"\s+", " ", str(value or "").strip()).lower()
+    return _normalize_name_key_cached(str(value or ""))
 
 
 def find_last_blast_recipient_for_chat(chat_context, last_blast=None):
@@ -1580,10 +2293,15 @@ def is_lark_host(host):
 def append_network_logs(entries):
     if not entries:
         return
-    log = load_network_log()
+    log = _read_cached_encrypted_data(
+        NETWORK_LOG_FILE,
+        list,
+        validator=ensure_list_data,
+        cache_cloner=clone_list_of_dicts,
+        direct=True
+    )
     log.extend(entries)
-    with open(NETWORK_LOG_FILE, "wb") as f:
-        f.write(encrypt_data(log))
+    _write_cached_encrypted_data(NETWORK_LOG_FILE, log, cache_cloner=clone_list_of_dicts)
 
 def is_scalar(value):
     return value is None or isinstance(value, (str, int, float, bool))
@@ -1742,7 +2460,7 @@ get_or_create_filenames()
 
 def encrypt_data(data):
     """Encrypt a Python object and return bytes."""
-    json_str = json.dumps(data, indent=2)
+    json_str = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     return fernet.encrypt(json_str.encode())
 
 def decrypt_data(encrypted_bytes):
@@ -1750,13 +2468,149 @@ def decrypt_data(encrypted_bytes):
     decrypted = fernet.decrypt(encrypted_bytes)
     return json.loads(decrypted.decode())
 
+
+def _read_cached_encrypted_data(path, default_factory, validator=None, return_cloner=None, cache_cloner=None, direct=False):
+    if not path:
+        data = default_factory()
+        if direct:
+            return data
+        if return_cloner:
+            return return_cloner(data)
+        return data
+
+    stamp = get_file_cache_stamp(path)
+    if stamp is None:
+        _ENCRYPTED_FILE_CACHE.pop(path, None)
+        data = default_factory()
+        if direct:
+            return data
+        if return_cloner:
+            return return_cloner(data)
+        return data
+
+    cached = _ENCRYPTED_FILE_CACHE.get(path)
+    if cached and cached.get("stamp") == stamp:
+        data = cached.get("data")
+        if direct:
+            return data
+        if return_cloner:
+            return return_cloner(data)
+        return data
+
+    try:
+        with open(path, "rb") as f:
+            encrypted = f.read()
+        data = decrypt_data(encrypted)
+    except Exception:
+        data = default_factory()
+
+    if validator is not None:
+        try:
+            data = validator(data)
+        except Exception:
+            data = default_factory()
+
+    cache_value = cache_cloner(data) if cache_cloner else data
+    _ENCRYPTED_FILE_CACHE[path] = {"stamp": stamp, "data": cache_value}
+
+    if direct:
+        return cache_value
+    if return_cloner:
+        return return_cloner(cache_value)
+    return cache_value
+
+
+def _write_cached_encrypted_data(path, data, cache_cloner=None):
+    if not path:
+        return
+    payload = encrypt_data(data)
+    with open(path, "wb") as f:
+        f.write(payload)
+    stamp = get_file_cache_stamp(path)
+    cache_value = cache_cloner(data) if cache_cloner else data
+    _ENCRYPTED_FILE_CACHE[path] = {"stamp": stamp, "data": cache_value}
+
+
+def load_saved_proxy_info():
+    default_info = build_default_proxy_info()
+    if not os.path.exists(PROXY_STATE_FILE):
+        return default_info
+
+    try:
+        with open(PROXY_STATE_FILE, "rb") as f:
+            raw = f.read()
+
+        try:
+            payload = decrypt_data(raw)
+        except Exception:
+            payload = json.loads(raw.decode("utf-8"))
+
+        if not isinstance(payload, dict):
+            return default_info
+
+        info = dict(default_info)
+        info.update(payload)
+        info["enabled"] = bool(info.get("enabled"))
+        info["host"] = str(info.get("host") or "").strip()
+        info["username"] = str(info.get("username") or "").strip()
+        info["password"] = str(info.get("password") or "")
+        try:
+            info["port"] = int(info.get("port") or 0)
+        except Exception:
+            info["port"] = 0
+
+        if not info["enabled"] or not info["host"] or info["port"] <= 0:
+            return default_info
+
+        proxy_type = str(info.get("type") or "HTTP").strip().upper()
+        info["type"] = "SOCKS5" if proxy_type == "SOCKS5" else "HTTP"
+        return info
+    except Exception:
+        return default_info
+
+
+def save_saved_proxy_info(proxy_info):
+    info = dict(build_default_proxy_info())
+    if isinstance(proxy_info, dict):
+        info.update(proxy_info)
+
+    info["enabled"] = bool(info.get("enabled"))
+    info["host"] = str(info.get("host") or "").strip()
+    info["username"] = str(info.get("username") or "").strip()
+    info["password"] = str(info.get("password") or "")
+    try:
+        info["port"] = int(info.get("port") or 0)
+    except Exception:
+        info["port"] = 0
+
+    if not info["enabled"] or not info["host"] or info["port"] <= 0:
+        info = build_default_proxy_info()
+    else:
+        proxy_type = str(info.get("type") or "HTTP").strip().upper()
+        info["type"] = "SOCKS5" if proxy_type == "SOCKS5" else "HTTP"
+
+    try:
+        os.makedirs(H_DIR, exist_ok=True)
+        with open(PROXY_STATE_FILE, "wb") as f:
+            f.write(encrypt_data(info))
+    except Exception as e:
+        print("Failed to save proxy state:", e)
+
 # --------------------------
 # History helpers (encrypted)
 # --------------------------
 def load_bad_words():
     source_path = BAD_WORDS_FILE if os.path.exists(BAD_WORDS_FILE) else DEFAULT_BAD_WORDS_FILE
     if not os.path.exists(source_path):
+        _BAD_WORDS_CACHE.update({"path": source_path, "stamp": None, "words": []})
         return []
+
+    stamp = get_file_cache_stamp(source_path)
+    if (
+        _BAD_WORDS_CACHE.get("path") == source_path
+        and _BAD_WORDS_CACHE.get("stamp") == stamp
+    ):
+        return clone_string_list(_BAD_WORDS_CACHE.get("words") or [])
 
     words = []
     seen = set()
@@ -1774,7 +2628,20 @@ def load_bad_words():
         print("Failed to load bad words:", e)
         return []
 
-    return words
+    _BAD_WORDS_CACHE.update({
+        "path": source_path,
+        "stamp": stamp,
+        "words": list(words)
+    })
+    return clone_string_list(words)
+
+
+@lru_cache(maxsize=64)
+def get_bad_word_mask_pattern(words_key):
+    escaped = [re.escape(w) for w in words_key if str(w).strip()]
+    if not escaped:
+        return None
+    return re.compile(r"\b(" + "|".join(escaped) + r")\b", re.IGNORECASE)
 
 
 def mask_bad_words(text, bad_words=None):
@@ -1783,11 +2650,10 @@ def mask_bad_words(text, bad_words=None):
     if not text or not bad_words:
         return text, []
 
-    escaped = [re.escape(w) for w in sorted(set(bad_words), key=len, reverse=True)]
-    if not escaped:
+    words_key = tuple(sorted(set(bad_words), key=len, reverse=True))
+    pattern = get_bad_word_mask_pattern(words_key)
+    if pattern is None:
         return text, []
-
-    pattern = re.compile(r"\b(" + "|".join(escaped) + r")\b", re.IGNORECASE)
     hits = []
 
     def repl(match):
@@ -1799,20 +2665,35 @@ def mask_bad_words(text, bad_words=None):
     return masked, hits
 
 
+def ensure_list_data(value):
+    return list(value) if isinstance(value, list) else []
+
+
+def ensure_bad_word_counter_data(value):
+    if not isinstance(value, dict):
+        return {"days": {}}
+    data = dict(value)
+    days = data.get("days")
+    data["days"] = days if isinstance(days, dict) else {}
+    return data
+
+
 def load_bad_word_counter():
-    if os.path.exists(BAD_WORD_COUNTER_FILE):
-        try:
-            with open(BAD_WORD_COUNTER_FILE, "rb") as f:
-                encrypted = f.read()
-            return decrypt_data(encrypted)
-        except Exception:
-            return {"days": {}}
-    return {"days": {}}
+    return _read_cached_encrypted_data(
+        BAD_WORD_COUNTER_FILE,
+        lambda: {"days": {}},
+        validator=ensure_bad_word_counter_data,
+        return_cloner=clone_nested_data,
+        cache_cloner=clone_nested_data
+    )
 
 
 def save_bad_word_counter(data):
-    with open(BAD_WORD_COUNTER_FILE, "wb") as f:
-        f.write(encrypt_data(data))
+    _write_cached_encrypted_data(
+        BAD_WORD_COUNTER_FILE,
+        ensure_bad_word_counter_data(data),
+        cache_cloner=clone_nested_data
+    )
 
 
 def clear_bad_word_counter():
@@ -1894,20 +2775,24 @@ def increment_bad_word_counter(
     save_bad_word_counter(data)
 
 def load_history():
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "rb") as f:
-                encrypted = f.read()
-            return decrypt_data(encrypted)
-        except Exception:
-            return []
-    return []
+    return _read_cached_encrypted_data(
+        HISTORY_FILE,
+        list,
+        validator=ensure_list_data,
+        return_cloner=clone_list_of_dicts,
+        cache_cloner=clone_list_of_dicts
+    )
 
 def save_history(entry):
-    hist = load_history()
+    hist = _read_cached_encrypted_data(
+        HISTORY_FILE,
+        list,
+        validator=ensure_list_data,
+        cache_cloner=clone_list_of_dicts,
+        direct=True
+    )
     hist.append(entry)
-    with open(HISTORY_FILE, "wb") as f:
-        f.write(encrypt_data(hist))
+    _write_cached_encrypted_data(HISTORY_FILE, hist, cache_cloner=clone_list_of_dicts)
 
 
 def build_whatsapp_history_signature(
@@ -1974,21 +2859,198 @@ def derive_whatsapp_history_signature_from_log_item(item):
         author=author
     )
 
+
+def normalize_whatsapp_history_account_key(value):
+    return re.sub(r"\s+", " ", str(value or "").strip()).lower()
+
+
+def get_whatsapp_history_self_account(item, direction=None):
+    if not isinstance(item, dict):
+        return ""
+
+    direction = direction or get_whatsapp_history_direction(item.get("send_type"))
+    if direction == "incoming":
+        return str(item.get("to") or item.get("account_label") or "").strip()
+    if direction == "outgoing":
+        return str(item.get("from") or item.get("account_label") or "").strip()
+    return str(item.get("account_label") or "").strip()
+
+
+def build_whatsapp_history_compare_key(
+    conversation_key,
+    direction,
+    timestamp_text,
+    content,
+    has_attachment=False,
+    author="",
+    self_account="",
+    include_account=False
+):
+    base_key = build_whatsapp_history_signature(
+        conversation_key=conversation_key,
+        direction=direction,
+        timestamp_text=timestamp_text,
+        content=content,
+        has_attachment=has_attachment,
+        author=author
+    )
+    if not base_key:
+        return ""
+
+    if not include_account:
+        return base_key
+
+    account_key = normalize_whatsapp_history_account_key(self_account)
+    if not account_key:
+        return ""
+
+    return "||".join([account_key, base_key])
+
+
+def derive_whatsapp_history_match_metadata(item):
+    if not isinstance(item, dict):
+        return {}
+
+    direction = get_whatsapp_history_direction(item.get("send_type"))
+    if direction == "other":
+        return {}
+
+    if direction == "incoming":
+        conversation_key = (
+            item.get("conversation_key")
+            or item.get("from_phone")
+            or item.get("chat_label")
+            or item.get("from")
+        )
+        author = item.get("from_display") or item.get("message_author") or ""
+    else:
+        conversation_key = (
+            item.get("conversation_key")
+            or item.get("to_phone")
+            or item.get("chat_label")
+            or item.get("to")
+        )
+        author = item.get("message_author") or ""
+
+    self_account = get_whatsapp_history_self_account(item, direction=direction)
+    timestamp_text = item.get("timestamp") or item.get("ts") or ""
+    content = item.get("content") or ""
+    has_attachment = bool(item.get("has_attachment"))
+
+    return {
+        "direction": direction,
+        "conversation_key": normalize_chat_key(conversation_key),
+        "author": str(author or "").strip(),
+        "self_account": self_account,
+        "self_account_key": normalize_whatsapp_history_account_key(self_account),
+        "raw_sig": str(item.get("sig") or "").strip(),
+        "derived_sig": build_whatsapp_history_signature(
+            conversation_key=conversation_key,
+            direction=direction,
+            timestamp_text=timestamp_text,
+            content=content,
+            has_attachment=has_attachment,
+            author=author
+        ),
+        "strict_key": build_whatsapp_history_compare_key(
+            conversation_key=conversation_key,
+            direction=direction,
+            timestamp_text=timestamp_text,
+            content=content,
+            has_attachment=has_attachment,
+            author=author,
+            self_account=self_account,
+            include_account=True
+        ),
+        "loose_key": build_whatsapp_history_compare_key(
+            conversation_key=conversation_key,
+            direction=direction,
+            timestamp_text=timestamp_text,
+            content=content,
+            has_attachment=has_attachment,
+            author=author,
+            include_account=False
+        )
+    }
+
+
+def merge_whatsapp_history_entries(existing_item, incoming_item, bad_words=None):
+    merged = dict(existing_item or {})
+    incoming = dict(incoming_item or {})
+
+    text_fields = [
+        "timestamp", "from", "from_display", "from_phone", "to", "to_phone",
+        "chat_label", "conversation_key", "content", "send_type", "trigger",
+        "status", "message_author", "account_label"
+    ]
+    for key in text_fields:
+        new_text = str(incoming.get(key) or "").strip()
+        if new_text:
+            merged[key] = incoming.get(key)
+
+    if bool(incoming.get("has_attachment")):
+        merged["has_attachment"] = True
+
+    try:
+        existing_length = int(merged.get("message_length") or 0)
+    except Exception:
+        existing_length = 0
+    try:
+        incoming_length = int(incoming.get("message_length") or 0)
+    except Exception:
+        incoming_length = 0
+    merged["message_length"] = max(existing_length, incoming_length, len(str(merged.get("content") or "")))
+
+    existing_bad_words = [
+        str(x).strip().lower()
+        for x in (merged.get("bad_words") or [])
+        if str(x).strip()
+    ]
+    incoming_bad_words = [
+        str(x).strip().lower()
+        for x in (incoming.get("bad_words") or [])
+        if str(x).strip()
+    ]
+    repaired_bad_words = sorted(set(existing_bad_words + incoming_bad_words))
+    try:
+        existing_bad_count = int(merged.get("bad_word_count") or 0)
+    except Exception:
+        existing_bad_count = 0
+    try:
+        incoming_bad_count = int(incoming.get("bad_word_count") or 0)
+    except Exception:
+        incoming_bad_count = 0
+    merged["bad_words"] = repaired_bad_words
+    merged["bad_word_count"] = max(existing_bad_count, incoming_bad_count, len(repaired_bad_words))
+
+    incoming_sig = str(incoming.get("sig") or "").strip()
+    existing_sig = str(merged.get("sig") or "").strip()
+    if incoming_sig and (not existing_sig or len(incoming_sig) >= len(existing_sig)):
+        merged["sig"] = incoming_sig
+
+    merged, _ = normalize_whatsapp_history_entry(merged, bad_words=bad_words)
+    changed = (merged != dict(existing_item or {}))
+    return merged, changed
+
 def load_network_log():
-    if os.path.exists(NETWORK_LOG_FILE):
-        try:
-            with open(NETWORK_LOG_FILE, "rb") as f:
-                encrypted = f.read()
-            return decrypt_data(encrypted)
-        except Exception:
-            return []
-    return []
+    return _read_cached_encrypted_data(
+        NETWORK_LOG_FILE,
+        list,
+        validator=ensure_list_data,
+        return_cloner=clone_list_of_dicts,
+        cache_cloner=clone_list_of_dicts
+    )
 
 def save_network_log(entry):
-    log = load_network_log()
+    log = _read_cached_encrypted_data(
+        NETWORK_LOG_FILE,
+        list,
+        validator=ensure_list_data,
+        cache_cloner=clone_list_of_dicts,
+        direct=True
+    )
     log.append(entry)
-    with open(NETWORK_LOG_FILE, "wb") as f:
-        f.write(encrypt_data(log))
+    _write_cached_encrypted_data(NETWORK_LOG_FILE, log, cache_cloner=clone_list_of_dicts)
 
 def normalize_saved_recipient(rec):
     if isinstance(rec, dict):
@@ -2140,20 +3202,33 @@ def save_last_blast(recipients, message, attachment_path=""):
     with open(LAST_BLAST_FILE, "wb") as f:
         f.write(encrypt_data(payload))
 
+
+def clear_last_blast_file():
+    with open(LAST_BLAST_FILE, "wb") as f:
+        f.write(encrypt_data({
+            "recipients": [],
+            "numbers": [],
+            "message": "",
+            "attachment_path": "",
+            "updated_at": ""
+        }))
+
 def load_manual_send_log():
-    if os.path.exists(MANUAL_SEND_LOG_FILE):
-        try:
-            with open(MANUAL_SEND_LOG_FILE, "rb") as f:
-                encrypted = f.read()
-            return decrypt_data(encrypted)
-        except Exception:
-            return []
-    return []
+    return _read_cached_encrypted_data(
+        MANUAL_SEND_LOG_FILE,
+        list,
+        validator=ensure_list_data,
+        return_cloner=clone_list_of_dicts,
+        cache_cloner=clone_list_of_dicts
+    )
 
 
 def write_manual_send_log(log_entries):
-    with open(MANUAL_SEND_LOG_FILE, "wb") as f:
-        f.write(encrypt_data(list(log_entries or [])))
+    _write_cached_encrypted_data(
+        MANUAL_SEND_LOG_FILE,
+        list(log_entries or []),
+        cache_cloner=clone_list_of_dicts
+    )
 
 def is_builtin_template_id(tpl_id):
     tpl_id = str(tpl_id or "").strip()
@@ -2189,6 +3264,148 @@ def set_builtin_template_enabled(template_id, enabled):
     enabled_map[template_id] = bool(enabled)
     state["builtin_templates_enabled"] = enabled_map
     save_app_state(state)
+
+
+def get_qc_notification_emails():
+    return normalize_qc_email_list(load_app_state().get("qc_notification_emails") or [])
+
+
+def set_qc_notification_emails(emails):
+    state = load_app_state()
+    state["qc_notification_emails"] = normalize_qc_email_list(emails)
+    save_app_state(state)
+
+
+def get_qc_whatsapp_numbers():
+    return normalize_qc_whatsapp_number_list(load_app_state().get("qc_notification_whatsapp_numbers") or [])
+
+
+def set_qc_whatsapp_numbers(numbers):
+    state = load_app_state()
+    state["qc_notification_whatsapp_numbers"] = normalize_qc_whatsapp_number_list(numbers)
+    save_app_state(state)
+
+
+def send_qc_notification_email_batch(recipients, account_label, batch_entries):
+    recipients = normalize_qc_email_list(recipients)
+    entries = [dict(item or {}) for item in list(batch_entries or []) if isinstance(item, dict)]
+    if not recipients or not entries:
+        return
+
+    account_label = str(account_label or "WhatsApp").strip() or "WhatsApp"
+    local_now_text = format_system_local_timestamp()
+    subject = f"[QC] WhatsApp Screenshot Batch | {account_label} | {len(entries)} screenshot(s)"
+
+    plain_lines = [
+        "WhatsApp QC screenshot batch notification",
+        "",
+        f"Sender Tab: {account_label}",
+        f"Prepared At: {local_now_text}",
+        f"Screenshot Count: {len(entries)}",
+        "",
+        "Rows:"
+    ]
+
+    html_rows = []
+    for index, entry in enumerate(entries, start=1):
+        details = dict(entry.get("details") or {})
+        timestamp_text = str(details.get("timestamp") or format_system_local_timestamp()).strip() or "-"
+        from_text = str(details.get("from") or "-").strip() or "-"
+        to_text = str(details.get("to") or "-").strip() or "-"
+        send_type = str(details.get("send_type") or "-").strip() or "-"
+        status = str(details.get("status") or "-").strip() or "-"
+        trigger = str(details.get("trigger") or "-").strip() or "-"
+        current_tab = str(details.get("current_tab") or account_label).strip() or account_label
+        preview = str(details.get("message_preview") or "").replace("\r", " ").replace("\n", " ").strip()
+        if len(preview) > 220:
+            preview = preview[:217] + "..."
+        current_url = str(details.get("current_url") or "-").strip() or "-"
+        capture_error = str(details.get("capture_error") or "").strip()
+        attachment_name = str(entry.get("attachment_name") or f"screenshot_{index:02d}.jpg")
+        attachment_state = "Attached" if entry.get("screenshot_bytes") else (f"Capture failed: {capture_error}" if capture_error else "Not attached")
+
+        plain_lines.append(
+            f"{index}. {timestamp_text} | {from_text} -> {to_text} | {send_type} | {status} | {trigger} | {attachment_state}"
+        )
+
+        html_rows.append(
+            "<tr>"
+            f"<td>{index}</td>"
+            f"<td>{html.escape(timestamp_text)}</td>"
+            f"<td>{html.escape(from_text)}</td>"
+            f"<td>{html.escape(to_text)}</td>"
+            f"<td>{html.escape(send_type)}</td>"
+            f"<td>{html.escape(status)}</td>"
+            f"<td>{html.escape(trigger)}</td>"
+            f"<td>{html.escape(current_tab)}</td>"
+            f"<td>{html.escape(preview or '-')}</td>"
+            f"<td>{html.escape(current_url)}</td>"
+            f"<td>{html.escape(attachment_name if entry.get('screenshot_bytes') else attachment_state)}</td>"
+            "</tr>"
+        )
+
+    html_body = f"""
+    <html>
+      <body style="font-family: Arial, sans-serif; color: #1f2937;">
+        <h3 style="margin-bottom: 8px;">WhatsApp QC Screenshot Batch</h3>
+        <p style="margin-top: 0;">
+          <b>Sender Tab:</b> {html.escape(account_label)}<br>
+          <b>Prepared At:</b> {html.escape(local_now_text)}<br>
+          <b>Screenshot Count:</b> {len(entries)}
+        </p>
+        <table border="1" cellspacing="0" cellpadding="6" style="border-collapse: collapse; font-size: 12px;">
+          <thead style="background: #e8f0ff;">
+            <tr>
+              <th>No</th>
+              <th>Timestamp</th>
+              <th>From</th>
+              <th>To</th>
+              <th>Send Type</th>
+              <th>Status</th>
+              <th>Trigger</th>
+              <th>Tab</th>
+              <th>Preview</th>
+              <th>Current URL</th>
+              <th>Attachment</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(html_rows)}
+          </tbody>
+        </table>
+      </body>
+    </html>
+    """
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = f"{QC_EMAIL_FROM_NAME} <{QC_EMAIL_USER}>"
+    msg["To"] = ", ".join(recipients)
+    msg.set_content("\n".join(plain_lines))
+    msg.add_alternative(html_body, subtype="html")
+
+    for index, entry in enumerate(entries, start=1):
+        screenshot_bytes = entry.get("screenshot_bytes")
+        if not screenshot_bytes:
+            continue
+        attachment_name = str(entry.get("attachment_name") or f"screenshot_{index:02d}.jpg")
+        msg.add_attachment(
+            screenshot_bytes,
+            maintype="image",
+            subtype="jpeg",
+            filename=attachment_name
+        )
+
+    timeout_sec = 25
+    if QC_EMAIL_SECURE:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(QC_EMAIL_HOST, QC_EMAIL_PORT, context=context, timeout=timeout_sec) as server:
+            server.login(QC_EMAIL_USER, QC_EMAIL_PASS)
+            server.send_message(msg)
+    else:
+        with smtplib.SMTP(QC_EMAIL_HOST, QC_EMAIL_PORT, timeout=timeout_sec) as server:
+            server.login(QC_EMAIL_USER, QC_EMAIL_PASS)
+            server.send_message(msg)
 
 
 def get_builtin_templates(include_disabled=False):
@@ -2427,16 +3644,13 @@ def normalize_contact_record(item):
 
 
 def load_contacts():
-    if os.path.exists(CONTACTS_FILE):
-        try:
-            with open(CONTACTS_FILE, "rb") as f:
-                encrypted = f.read()
-            data = decrypt_data(encrypted)
-            if isinstance(data, list):
-                return [normalize_contact_record(x) for x in data]
-        except Exception:
-            pass
-    return []
+    return _read_cached_encrypted_data(
+        CONTACTS_FILE,
+        list,
+        validator=lambda data: [normalize_contact_record(x) for x in data] if isinstance(data, list) else [],
+        return_cloner=clone_nested_data,
+        cache_cloner=clone_nested_data
+    )
 
 
 def save_contacts(contacts):
@@ -2464,8 +3678,7 @@ def save_contacts(contacts):
 
     cleaned.sort(key=lambda x: ((x.get("name") or "").lower(), x.get("send_number") or ""))
 
-    with open(CONTACTS_FILE, "wb") as f:
-        f.write(encrypt_data(cleaned))
+    _write_cached_encrypted_data(CONTACTS_FILE, cleaned, cache_cloner=clone_nested_data)
 
 
 def find_contact_index(contacts, send_number):
@@ -2957,8 +4170,9 @@ def format_duration_hms(seconds):
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def normalize_contact_identifier(raw):
-    s = str(raw or "").strip()
+@lru_cache(maxsize=8192)
+def _normalize_contact_identifier_cached(text):
+    s = str(text or "").strip()
     if not s:
         return None
 
@@ -2971,6 +4185,10 @@ def normalize_contact_identifier(raw):
         return digits
 
     return s
+
+
+def normalize_contact_identifier(raw):
+    return _normalize_contact_identifier_cached(str(raw or ""))
 
 
 def _default_activity_bucket():
@@ -3347,30 +4565,44 @@ def build_productivity_tips(snapshot):
     reply_rate = float(snapshot.get("reply_rate", 0.0))
 
     if sent_total < 20:
-        tips.append("Increase outreach volume. Try focused sending blocks until you reach at least 20 successful contacts today.")
+        tips.append("You are getting started. Keep pushing with a few more focused outreach blocks and the day can still close strong.")
 
     if screen_time_seconds >= 2 * 60 * 60 and sent_total < 15:
-        tips.append("A lot of active app time is not turning into outreach. Reduce idle browsing and work in tighter batches.")
+        tips.append("You are almost there. Try turning active screen time into tighter send batches so the effort shows up in results.")
 
     if avg_reply_speed is not None and avg_reply_speed > 30 * 60:
-        tips.append(f"Reply speed is slow at {format_duration_hms(avg_reply_speed)}. Aim to respond within 15–30 minutes after an incoming reply.")
+        tips.append(f"Follow-up can be sharper at {format_duration_hms(avg_reply_speed)} average reply time. Faster replies should help the momentum.")
 
     if sent_total >= 15 and reply_rate < 15.0:
-        tips.append("Reply rate is low. Improve message quality, follow-up sequence, or targeting instead of only increasing volume.")
+        tips.append("Your volume is there, but replies can improve. Try refining the wording or targeting instead of only sending more.")
 
     if touched_contacts < 10 and sent_total >= 10:
-        tips.append("Expand the contact pool. Reaching more unique contacts usually improves daily pipeline coverage.")
+        tips.append("Good effort so far. Expanding to more unique contacts could help your pipeline feel less stuck.")
 
     if failed_total > 0:
-        tips.append("There are failed sends today. Check recipient validity, WhatsApp page state, or connection stability.")
+        tips.append("A few sends did not land. Clean that up and the rest of your progress will look much better.")
 
     if received_total == 0 and sent_total >= 10:
-        tips.append("No replies yet today. Review template wording and send timing to improve engagement.")
+        tips.append("No replies yet, but don’t lose pace. A timing or template adjustment may unlock better engagement.")
 
     if not tips:
-        tips.append("Performance looks healthy today. Keep the same pace, maintain fast follow-up, and avoid unnecessary tab switching.")
+        tips.append("Keep it up. Your activity looks steady today, so stay consistent and protect the pace you already built.")
 
     return tips[:5]
+
+
+def build_productivity_encouragement(snapshot):
+    score = compute_productivity_score(snapshot)
+    sent_total = int(snapshot.get("sent_total", 0))
+    received_total = int(snapshot.get("received_total", 0))
+
+    if score >= 80:
+        return "Keep it up. Today looks strong and consistent."
+    if score >= 60:
+        return "You are almost there. A bit more consistency can make today look even better."
+    if sent_total >= 10 or received_total > 0:
+        return "There is progress on the board. Stay focused and keep the momentum moving."
+    return "Let’s build the day step by step. A few solid outreach blocks will help a lot."
 
 
 def build_daily_performance_snapshot(day_key_value=None):
@@ -3439,6 +4671,7 @@ def build_daily_performance_snapshot(day_key_value=None):
 
     snapshot["productivity_score"] = compute_productivity_score(snapshot)
     snapshot["tips"] = build_productivity_tips(snapshot)
+    snapshot["encouragement"] = build_productivity_encouragement(snapshot)
     return snapshot
 
 
@@ -3465,12 +4698,76 @@ def save_manual_send_log(entry):
 def clear_manual_send_log_file():
     write_manual_send_log([])
 
-def normalize_phone_number(raw):
-    s = str(raw or "").strip()
+
+def split_email_candidates(values):
+    if isinstance(values, str):
+        raw_parts = re.split(r"[\n,;]+", values)
+    elif isinstance(values, (list, tuple, set)):
+        raw_parts = list(values)
+    else:
+        raw_parts = []
+
+    return [str(part or "").strip() for part in raw_parts if str(part or "").strip()]
+
+
+def normalize_qc_email_list(values):
+    items = []
+    seen = set()
+
+    for part in split_email_candidates(values):
+        email = part.strip().lower()
+        if not EMAIL_ADDRESS_RE.match(email):
+            continue
+        if email in seen:
+            continue
+        seen.add(email)
+        items.append(email)
+        if len(items) >= QC_NOTIFICATION_MAX_EMAILS:
+            break
+
+    return items
+
+
+def normalize_qc_whatsapp_number_list(values):
+    items = []
+    seen = set()
+
+    for part in split_email_candidates(values):
+        raw = str(part or "").strip()
+        if not raw:
+            continue
+
+        send_number, _ = normalize_indonesia_mobile(raw)
+        if not send_number:
+            digits = normalize_phone_number(raw).lstrip("+")
+            if digits.startswith("0"):
+                digits = "62" + digits[1:]
+            if len(digits) >= 8:
+                send_number = digits
+
+        if not send_number:
+            continue
+        if send_number in seen:
+            continue
+
+        seen.add(send_number)
+        items.append(send_number)
+        if len(items) >= QC_NOTIFICATION_MAX_WHATSAPP:
+            break
+
+    return items
+
+@lru_cache(maxsize=8192)
+def _normalize_phone_number_cached(text):
+    s = str(text or "").strip()
     s = s.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
     if s.startswith("+"):
         return "+" + "".join(ch for ch in s[1:] if ch.isdigit())
     return "".join(ch for ch in s if ch.isdigit())
+
+
+def normalize_phone_number(raw):
+    return _normalize_phone_number_cached(str(raw or ""))
 
 def normalize_whatsapp_self_number(raw):
     text = str(raw or "").strip()
@@ -3516,7 +4813,9 @@ def load_app_state():
         "wa_account_ids": [1],
         "allow_custom_bulk_message": False,
         "builtin_templates_enabled": dict(DEFAULT_BUILTIN_TEMPLATE_ENABLED),
-        "cashier_mode_enabled": False
+        "cashier_mode_enabled": False,
+        "qc_notification_emails": [],
+        "qc_notification_whatsapp_numbers": []
     }
 
     if not os.path.exists(APP_STATE_FILE):
@@ -3532,6 +4831,10 @@ def load_app_state():
 
         allow_custom_bulk_message = bool(data.get("allow_custom_bulk_message", False))
         cashier_mode_enabled = bool(data.get("cashier_mode_enabled", False))
+        qc_notification_emails = normalize_qc_email_list(data.get("qc_notification_emails") or [])
+        qc_notification_whatsapp_numbers = normalize_qc_whatsapp_number_list(
+            data.get("qc_notification_whatsapp_numbers") or []
+        )
         builtin_templates_enabled = dict(DEFAULT_BUILTIN_TEMPLATE_ENABLED)
         stored_builtin = data.get("builtin_templates_enabled") or {}
         if isinstance(stored_builtin, dict):
@@ -3542,7 +4845,9 @@ def load_app_state():
             "wa_account_ids": wa_ids or [1],
             "allow_custom_bulk_message": allow_custom_bulk_message,
             "builtin_templates_enabled": builtin_templates_enabled,
-            "cashier_mode_enabled": cashier_mode_enabled
+            "cashier_mode_enabled": cashier_mode_enabled,
+            "qc_notification_emails": qc_notification_emails,
+            "qc_notification_whatsapp_numbers": qc_notification_whatsapp_numbers
         }
     except Exception:
         return default_state
@@ -3561,7 +4866,11 @@ def save_app_state(state):
             "wa_account_ids": wa_ids,
             "allow_custom_bulk_message": bool(state.get("allow_custom_bulk_message", False)),
             "builtin_templates_enabled": dict(DEFAULT_BUILTIN_TEMPLATE_ENABLED),
-            "cashier_mode_enabled": bool(state.get("cashier_mode_enabled", False))
+            "cashier_mode_enabled": bool(state.get("cashier_mode_enabled", False)),
+            "qc_notification_emails": normalize_qc_email_list(state.get("qc_notification_emails") or []),
+            "qc_notification_whatsapp_numbers": normalize_qc_whatsapp_number_list(
+                state.get("qc_notification_whatsapp_numbers") or []
+            )
         }
 
         stored_builtin = state.get("builtin_templates_enabled") or {}
@@ -3585,6 +4894,65 @@ def host_allowed(url_str, allowed_sites):
         if host_matches_rule(host, allowed_host):
             return True
     return False
+
+
+def normalize_download_extension(ext):
+    ext = str(ext or "").strip().lower()
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+    return ext
+
+
+def normalize_download_mime(mime_type):
+    return str(mime_type or "").strip().lower().split(";", 1)[0]
+
+
+def is_allowed_download_target(ext="", mime_type=""):
+    normalized_ext = normalize_download_extension(ext)
+    normalized_mime = normalize_download_mime(mime_type)
+
+    if normalized_ext in ALLOWED_DOWNLOAD_EXTENSIONS:
+        return True
+    if normalized_mime in ALLOWED_DOWNLOAD_MIME_TYPES:
+        return True
+    if any(normalized_mime.startswith(prefix) for prefix in ALLOWED_DOWNLOAD_MIME_PREFIXES):
+        return True
+    return False
+
+
+def infer_download_extension(candidate_name="", mime_type="", path="", url_text=""):
+    candidate_name = str(candidate_name or "").strip()
+    normalized_mime = normalize_download_mime(mime_type)
+
+    ext = normalize_download_extension(os.path.splitext(candidate_name)[1])
+    if ext:
+        return ext
+
+    guessed_ext = DOWNLOAD_MIME_EXTENSION_MAP.get(normalized_mime) or mimetypes.guess_extension(normalized_mime or "")
+    ext = normalize_download_extension(guessed_ext)
+    if ext:
+        return ext
+
+    for raw_value in (path, url_text):
+        raw_value = str(raw_value or "").strip()
+        if not raw_value:
+            continue
+        try:
+            parsed = urllib.parse.urlparse(raw_value)
+            probe = urllib.parse.unquote(parsed.path or raw_value)
+        except Exception:
+            probe = raw_value
+        probe_ext = normalize_download_extension(os.path.splitext(os.path.basename(probe))[1])
+        if probe_ext:
+            return probe_ext
+
+    if normalized_mime.startswith("image/"):
+        return ".jpg"
+    if normalized_mime.startswith("video/"):
+        return ".mp4"
+    if normalized_mime.startswith("audio/"):
+        return ".mp3"
+    return ""
 
 def is_google_host_allowed(host):
     host = (host or "").lower().strip()
@@ -4114,6 +5482,18 @@ class CustomWebEnginePage(QWebEnginePage):
                 )
             return False
 
+        if (
+            current_meta.get("name") == "WhatsApp" and
+            QUrl(target_url).scheme().lower() in ("http", "https")
+        ):
+            self.main_window.show_blocked_external_url_notice("WhatsApp", target_url)
+            if not current_meta.get("is_fixed"):
+                QTimer.singleShot(
+                    0,
+                    lambda v=current_view: self.main_window.close_web_view_tab(v)
+                )
+            return False
+
         self.main_window.status_bar.showMessage(
             f"Navigation blocked – only {current_meta['name']} sites allowed.",
             3000
@@ -4445,17 +5825,15 @@ class BulkWhatsAppDialog(QDialog):
         self.update_summary()
 
     def _apply_screen_friendly_size(self):
-        screen = self.screen() or QApplication.primaryScreen()
-        if not screen:
-            self.resize(1100, 820)
-            self.setMinimumSize(960, 700)
-            return
-
-        g = screen.availableGeometry()
-        width = max(960, min(1220, int(g.width() * 0.88)))
-        height = max(700, min(900, int(g.height() * 0.88)))
-        self.resize(width, height)
-        self.setMinimumSize(920, 680)
+        apply_screen_friendly_window_size(
+            self,
+            1100,
+            820,
+            min_width=920,
+            min_height=680,
+            width_ratio=0.88,
+            height_ratio=0.88
+        )
 
     def _make_stable_list_widget(self):
         w = QListWidget()
@@ -4779,6 +6157,9 @@ class TemplateManagerDialog(QDialog):
             builtin_layout.addWidget(checkbox)
             self.builtin_checkboxes[str(tpl.get("id"))] = checkbox
 
+        self.builtin_browse_btn = QPushButton("Browse Built-ins")
+        builtin_layout.addWidget(self.builtin_browse_btn)
+
         left_layout.addWidget(self.builtin_group)
 
         splitter.addWidget(left)
@@ -4826,7 +6207,7 @@ class TemplateManagerDialog(QDialog):
         help_label = QLabel(
             "Supported placeholders: ${name}, ${data1}, ${data2}, ${data3}, ...\n"
             "Missing values will become NULL.\n"
-            "Only user-created templates can be edited here. Built-in templates can be enabled/disabled from the left panel."
+            "User-created templates can be edited here. Built-in templates can be enabled/disabled from the left panel or copied into your own editable template."
         )
         help_label.setWordWrap(True)
         help_label.setStyleSheet("padding:6px;border:1px solid #ddd;border-radius:6px;")
@@ -4847,12 +6228,20 @@ class TemplateManagerDialog(QDialog):
         self.template_list.itemSelectionChanged.connect(self.on_template_selected)
         self.new_btn.clicked.connect(self.new_template)
         self.delete_btn.clicked.connect(self.delete_template)
+        self.builtin_browse_btn.clicked.connect(self.open_builtin_template_browser)
         self.save_btn.clicked.connect(self.save_template)
         self.attachment_pick_btn.clicked.connect(self.choose_attachment)
         self.attachment_clear_btn.clicked.connect(self.clear_attachment)
         self.close_btn.clicked.connect(self.accept)
 
         self.refresh_list()
+        apply_screen_friendly_window_size(
+            self,
+            1120,
+            720,
+            min_width=950,
+            min_height=620
+        )
 
     def refresh_list(self):
         self.templates = load_user_templates()
@@ -4895,6 +6284,19 @@ class TemplateManagerDialog(QDialog):
         self._set_attachment_path("")
         self.name_edit.setFocus()
 
+    def load_template_into_editor(self, template_data, as_copy=False):
+        tpl = dict(template_data or {})
+        self.current_template_id = None if as_copy else tpl.get("id")
+        self.template_list.clearSelection()
+        name = str(tpl.get("name") or "").strip()
+        if as_copy and name:
+            name = f"{name} Copy"
+        self.name_edit.setText(name)
+        self.content_edit.setPlainText(str(tpl.get("content") or ""))
+        self._set_attachment_path(tpl.get("attachment_path"))
+        self.name_edit.setFocus()
+        self.name_edit.selectAll()
+
     def _set_attachment_path(self, path):
         normalized = normalize_template_attachment_path(path)
         self.attachment_path_label.setProperty("attachment_path", normalized)
@@ -4921,6 +6323,14 @@ class TemplateManagerDialog(QDialog):
 
     def clear_attachment(self):
         self._set_attachment_path("")
+
+    def open_builtin_template_browser(self):
+        dlg = BuiltinTemplateBrowserDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected = dlg.selected_template_data()
+        if selected:
+            self.load_template_into_editor(selected, as_copy=True)
 
     def save_template(self):
         name = self.name_edit.text().strip()
@@ -5025,6 +6435,98 @@ class TemplateManagerDialog(QDialog):
             parent.apply_bulk_message_policy_ui()
 
 
+class BuiltinTemplateBrowserDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Built-in WhatsApp Templates")
+        self.setMinimumSize(860, 560)
+        self._templates = get_builtin_templates(include_disabled=True)
+
+        root = QVBoxLayout(self)
+
+        intro = QLabel(
+            "Browse the built-in templates below. You can copy one into your own template list, then rename and edit it before saving."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("padding:8px;border:1px solid #9ab2d8;background:#f4f7ff;")
+        root.addWidget(intro)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        root.addWidget(splitter, 1)
+
+        self.template_list = QListWidget(self)
+        splitter.addWidget(self.template_list)
+
+        right = QWidget(self)
+        right_layout = QVBoxLayout(right)
+
+        self.name_label = QLabel("-")
+        self.name_label.setStyleSheet("font-size:15px;font-weight:700;")
+        right_layout.addWidget(self.name_label)
+
+        self.status_label = QLabel("")
+        right_layout.addWidget(self.status_label)
+
+        right_layout.addWidget(QLabel("Content"))
+        self.content_edit = QTextEdit(self)
+        self.content_edit.setReadOnly(True)
+        configure_scrollable_text_edit(self.content_edit, min_height=260, always_show_scroll=True)
+        right_layout.addWidget(self.content_edit, 1)
+
+        self.attachment_label = QLabel("Attachment: -")
+        self.attachment_label.setWordWrap(True)
+        self.attachment_label.setStyleSheet("padding:6px;border:1px solid #ddd;border-radius:6px;")
+        right_layout.addWidget(self.attachment_label)
+
+        action_row = QHBoxLayout()
+        self.copy_btn = QPushButton("Copy As My Template")
+        close_btn = QPushButton("Close")
+        action_row.addStretch()
+        action_row.addWidget(self.copy_btn)
+        action_row.addWidget(close_btn)
+        right_layout.addLayout(action_row)
+
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+
+        for tpl in self._templates:
+            label = str(tpl.get("name") or "")
+            if not tpl.get("enabled", True):
+                label += " (Disabled)"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, dict(tpl))
+            self.template_list.addItem(item)
+
+        self.template_list.itemSelectionChanged.connect(self.render_selected)
+        self.copy_btn.clicked.connect(self.accept)
+        close_btn.clicked.connect(self.reject)
+
+        if self.template_list.count() > 0:
+            self.template_list.setCurrentRow(0)
+
+        apply_screen_friendly_window_size(
+            self,
+            980,
+            620,
+            min_width=860,
+            min_height=560
+        )
+
+    def render_selected(self):
+        item = self.template_list.currentItem()
+        tpl = item.data(Qt.ItemDataRole.UserRole) if item else {}
+        self.name_label.setText(str(tpl.get("name") or "-"))
+        enabled_text = "Enabled" if tpl.get("enabled", True) else "Disabled"
+        self.status_label.setText(f"Status: {enabled_text}    |    Updated: {tpl.get('updated_at') or '-'}")
+        self.content_edit.setPlainText(str(tpl.get("content") or ""))
+        self.attachment_label.setText(f"Attachment: {format_template_attachment_label(tpl.get('attachment_path'))}")
+
+    def selected_template_data(self):
+        item = self.template_list.currentItem()
+        return dict(item.data(Qt.ItemDataRole.UserRole) or {}) if item else {}
+
+
 class TemplateReplyDialog(QDialog):
     def __init__(self, chat_context=None, reply_recipient=None, matched_recipient=None, templates=None, parent=None):
         super().__init__(parent)
@@ -5094,6 +6596,14 @@ class TemplateReplyDialog(QDialog):
         if self.template_combo.count() > 0:
             self.template_combo.setCurrentIndex(0)
             self.apply_selected_template()
+
+        apply_screen_friendly_window_size(
+            self,
+            880,
+            620,
+            min_width=760,
+            min_height=560
+        )
 
     def _find_template_by_id(self, tpl_id):
         for tpl in self.templates:
@@ -5409,6 +6919,43 @@ class LockedBrowserApiHandler(BaseHTTPRequestHandler):
                 return data.get(key)
         return None
 
+    def _dispatch_main_window_request(self, action, timeout=5.0, **kwargs):
+        main_window = getattr(self.server, "main_window", None)
+        signal = getattr(main_window, "api_bridge_request_signal", None)
+        if main_window is None or signal is None:
+            return {
+                "ok": False,
+                "status": 500,
+                "error": "Main window is not available"
+            }
+
+        done = threading.Event()
+        result = {}
+        request_payload = {
+            "action": str(action or "").strip(),
+            "done": done,
+            "result": result,
+        }
+        request_payload.update(kwargs)
+
+        try:
+            signal.emit(request_payload)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": 500,
+                "error": str(exc or "Failed to dispatch request to main window")
+            }
+
+        if not done.wait(max(0.1, float(timeout or 5.0))):
+            return {
+                "ok": False,
+                "status": 504,
+                "error": "Timed out while waiting for the main window"
+            }
+
+        return dict(result or {})
+
     def do_GET(self):
         if not self._require_auth():
             return
@@ -5478,6 +7025,159 @@ class LockedBrowserApiHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 **data
             })
+            return
+
+        if path == "/api/v1/get/qc-conversations":
+            page = safe_int(query.get("page", ["1"])[0], 1, 1, 1000000)
+            page_size = safe_int(query.get("pageSize", ["20"])[0], 20, 1, 500)
+            search_text = str(query.get("search", [""])[0] or "").strip()
+            account_filter = str(query.get("account", [""])[0] or "").strip()
+
+            items = build_qc_api_conversation_summaries(
+                account_filter=account_filter,
+                search_text=search_text
+            )
+            data = paginate_items(items, page, page_size)
+            self._send_json(200, {
+                "ok": True,
+                "search": search_text,
+                "account": account_filter,
+                **data
+            })
+            return
+
+        if path == "/api/v1/get/qc-conversation-messages":
+            page = safe_int(query.get("page", ["1"])[0], 1, 1, 1000000)
+            page_size = safe_int(query.get("pageSize", ["100"])[0], 100, 1, 500)
+            account_filter = str(query.get("account", [""])[0] or "").strip()
+            contact_query = (
+                str(query.get("contactKey", [""])[0] or "").strip()
+                or str(query.get("contactPhone", [""])[0] or "").strip()
+                or str(query.get("contact", [""])[0] or "").strip()
+                or str(query.get("search", [""])[0] or "").strip()
+            )
+
+            if not contact_query:
+                self._send_json(400, {
+                    "ok": False,
+                    "message": "contactKey, contactPhone, contact, or search is required"
+                })
+                return
+
+            summary, items = build_qc_api_conversation_messages(
+                contact_query=contact_query,
+                account_filter=account_filter
+            )
+            if summary is None:
+                self._send_json(404, {
+                    "ok": False,
+                    "message": "Conversation not found"
+                })
+                return
+
+            data = paginate_items(items, page, page_size)
+            self._send_json(200, {
+                "ok": True,
+                "contact_query": contact_query,
+                "account": account_filter,
+                "conversation": summary,
+                **data
+            })
+            return
+
+        if path == "/api/v1/get/client-info":
+            response = self._dispatch_main_window_request("get_client_info", timeout=4.0)
+            if not response.get("ok"):
+                self._send_json(safe_int(response.get("status"), 500, 0), {
+                    "ok": False,
+                    "message": str(response.get("error") or "Failed to collect client information")
+                })
+                return
+
+            client_info = dict(response.get("payload") or {})
+            self._send_json(200, {
+                "ok": True,
+                **client_info
+            })
+            return
+
+        if path == "/api/v1/get/tab-stats":
+            response = self._dispatch_main_window_request("get_tab_stats", timeout=12.0)
+            if not response.get("ok"):
+                self._send_json(safe_int(response.get("status"), 500, 0), {
+                    "ok": False,
+                    "message": str(response.get("error") or "Failed to collect tab statistics")
+                })
+                return
+
+            tab_stats = dict(response.get("payload") or {})
+            self._send_json(200, {
+                "ok": True,
+                **tab_stats
+            })
+            return
+
+        if path == "/api/v1/get/active-tab-screenshot":
+            main_window = getattr(self.server, "main_window", None)
+            if not main_window:
+                self._send_json(500, {
+                    "ok": False,
+                    "message": "Main window is not available"
+                })
+                return
+
+            quality = safe_int(query.get("quality", ["82"])[0], 82, 20, 95)
+            max_width = safe_int(query.get("maxWidth", ["1440"])[0], 1440, 320, 3840)
+
+            done = threading.Event()
+            result = {}
+
+            main_window.live_view_request_signal.emit({
+                "done": done,
+                "result": result,
+                "quality": quality,
+                "max_width": max_width,
+                "scope": "tab"
+            })
+
+            if not done.wait(5):
+                self._send_json(504, {
+                    "ok": False,
+                    "message": "Timed out while capturing the active tab screenshot"
+                })
+                return
+
+            if not result.get("ok"):
+                self._send_json(500, {
+                    "ok": False,
+                    "message": str(result.get("error") or "Failed to capture the active tab screenshot")
+                })
+                return
+
+            frame = result.get("frame") or b""
+            meta = result.get("meta") or {}
+            if not frame:
+                self._send_json(500, {
+                    "ok": False,
+                    "message": "Active tab screenshot is empty"
+                })
+                return
+
+            self.send_response(200)
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Connection", "close")
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(frame)))
+            self.send_header("Content-Disposition", 'inline; filename="active-tab.jpg"')
+            self.send_header("X-Captured-At", str(meta.get("captured_at", "") or ""))
+            self.send_header("X-Current-Tab", str(meta.get("current_tab", "") or ""))
+            self.send_header("X-Current-Url", str(meta.get("current_url", "") or ""))
+            self.send_header("X-Scope", str(meta.get("scope", "tab") or "tab"))
+            self.send_header("X-Width", str(meta.get("width", "") or ""))
+            self.send_header("X-Height", str(meta.get("height", "") or ""))
+            self.end_headers()
+            self.wfile.write(frame)
             return
 
         if path == "/api/v1/live-view":
@@ -5704,6 +7404,48 @@ class LockedBrowserApiHandler(BaseHTTPRequestHandler):
             })
             return
 
+        if path == "/api/v1/show/popup-message":
+            title = str(self._get_payload_value(payload, "title", "popup_title", "subject") or "Master Notice").strip()
+            message = str(self._get_payload_value(payload, "message", "content", "body") or "").strip()
+            level = str(self._get_payload_value(payload, "level", "type", "severity") or "info").strip().lower()
+            source = str(self._get_payload_value(payload, "source", "from") or "Master Dashboard").strip()
+            duration_seconds = safe_int(
+                self._get_payload_value(payload, "durationSeconds", "duration_seconds", "duration"),
+                0,
+                0,
+                24 * 60 * 60
+            )
+
+            if not message:
+                self._send_json(400, {
+                    "ok": False,
+                    "message": "message is required"
+                })
+                return
+
+            response = self._dispatch_main_window_request(
+                "show_popup_message",
+                timeout=4.0,
+                title=title,
+                message=message,
+                level=level,
+                source=source,
+                duration_seconds=duration_seconds
+            )
+            if not response.get("ok"):
+                self._send_json(safe_int(response.get("status"), 500, 0), {
+                    "ok": False,
+                    "message": str(response.get("error") or "Failed to show popup message")
+                })
+                return
+
+            popup_result = dict(response.get("payload") or {})
+            self._send_json(200, {
+                "ok": True,
+                **popup_result
+            })
+            return
+
         self._send_json(404, {
             "ok": False,
             "message": "Not found"
@@ -5759,16 +7501,17 @@ class UserStatsDialog(QDialog):
             key=lambda x: int(x[1] or 0),
             reverse=True
         )
-        self.tab_table.setRowCount(len(tab_items))
-        for row_index, (tab_name, sec) in enumerate(tab_items):
-            sec = int(sec or 0)
-            self.tab_table.setItem(row_index, 0, make_table_item(str(tab_name)))
-            self.tab_table.setItem(row_index, 1, make_table_item(format_duration_hms(sec)))
-            self.tab_table.setItem(
-                row_index,
-                2,
-                make_table_item(str(sec), align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            )
+        with table_update_batch(self.tab_table):
+            self.tab_table.setRowCount(len(tab_items))
+            for row_index, (tab_name, sec) in enumerate(tab_items):
+                sec = int(sec or 0)
+                self.tab_table.setItem(row_index, 0, make_table_item(str(tab_name)))
+                self.tab_table.setItem(row_index, 1, make_table_item(format_duration_hms(sec)))
+                self.tab_table.setItem(
+                    row_index,
+                    2,
+                    make_table_item(str(sec), align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                )
 
         if self.tab_table.rowCount() > 0:
             select_first_table_row(self.tab_table)
@@ -5784,6 +7527,14 @@ class UserStatsDialog(QDialog):
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         root.addWidget(close_btn)
+
+        apply_screen_friendly_window_size(
+            self,
+            1080,
+            760,
+            min_width=980,
+            min_height=700
+        )
 
 class ContactLogDialog(QDialog):
     def __init__(self, parent=None):
@@ -5824,6 +7575,14 @@ class ContactLogDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+        apply_screen_friendly_window_size(
+            self,
+            560,
+            360,
+            min_width=520,
+            min_height=320
+        )
 
     def get_entry(self):
         return {
@@ -5936,20 +7695,20 @@ class ContactEditorDialog(QDialog):
 
         profile_layout.addWidget(QLabel("Summary"))
         self.summary_edit = QTextEdit()
-        self.summary_edit.setMinimumHeight(120)
+        configure_scrollable_text_edit(self.summary_edit, min_height=120, always_show_scroll=True)
         self.summary_edit.setPlainText(self.contact.get("summary", ""))
         profile_layout.addWidget(self.summary_edit)
 
         profile_layout.addWidget(QLabel("Detailed Background / Notes"))
         self.details_edit = QTextEdit()
-        self.details_edit.setMinimumHeight(220)
+        configure_scrollable_text_edit(self.details_edit, min_height=220, always_show_scroll=True)
         self.details_edit.setPlainText(self.contact.get("details", ""))
         profile_layout.addWidget(self.details_edit)
 
         import_info = self.contact.get("latest_import_vars") or {}
         self.import_preview = QTextEdit()
         self.import_preview.setReadOnly(True)
-        self.import_preview.setMinimumHeight(150)
+        configure_scrollable_text_edit(self.import_preview, min_height=150, always_show_scroll=True)
         self.import_preview.setPlainText(
             json.dumps(import_info, indent=2, ensure_ascii=False) if import_info else "-"
         )
@@ -6014,6 +7773,13 @@ class ContactEditorDialog(QDialog):
 
         self.refresh_stats()
         self.refresh_timeline()
+        apply_screen_friendly_window_size(
+            self,
+            1240,
+            860,
+            min_width=1180,
+            min_height=820
+        )
 
     def refresh_stats(self):
         self.stats_label.setText(
@@ -6025,23 +7791,24 @@ class ContactEditorDialog(QDialog):
     def refresh_timeline(self):
         rows = list(self.contact.get("timeline") or [])
         rows = sorted(rows, key=lambda x: str(x.get("timestamp") or ""), reverse=True)
-        self.timeline_table.setRowCount(0)
+        with table_update_batch(self.timeline_table):
+            self.timeline_table.setRowCount(0)
 
-        if not rows:
-            return
+            if not rows:
+                return
 
-        self.timeline_table.setRowCount(len(rows))
-        for row_index, entry in enumerate(rows):
-            entry_type = str(entry.get("type") or "note").strip() or "note"
-            timestamp_item = make_table_item(
-                format_user_datetime_text(entry.get("timestamp"), default="-"),
-                user_data=str(entry.get("id") or "")
-            )
-            type_item = make_table_item(entry_type.replace("_", " ").title())
-            text_item = make_table_item(str(entry.get("text") or "").strip())
-            self.timeline_table.setItem(row_index, 0, timestamp_item)
-            self.timeline_table.setItem(row_index, 1, type_item)
-            self.timeline_table.setItem(row_index, 2, text_item)
+            self.timeline_table.setRowCount(len(rows))
+            for row_index, entry in enumerate(rows):
+                entry_type = str(entry.get("type") or "note").strip() or "note"
+                timestamp_item = make_table_item(
+                    format_user_datetime_text(entry.get("timestamp"), default="-"),
+                    user_data=str(entry.get("id") or "")
+                )
+                type_item = make_table_item(entry_type.replace("_", " ").title())
+                text_item = make_table_item(str(entry.get("text") or "").strip())
+                self.timeline_table.setItem(row_index, 0, timestamp_item)
+                self.timeline_table.setItem(row_index, 1, type_item)
+                self.timeline_table.setItem(row_index, 2, text_item)
 
         select_first_table_row(self.timeline_table)
 
@@ -6317,6 +8084,13 @@ class ContactManagerDialog(QDialog):
         self.contact_table.itemDoubleClicked.connect(lambda *_: self.edit_selected_contact())
 
         self.render_contacts()
+        apply_screen_friendly_window_size(
+            self,
+            1280,
+            760,
+            min_width=1280,
+            min_height=760
+        )
 
     def _selected_send_number(self):
         row = self.contact_table.currentRow()
@@ -6400,29 +8174,30 @@ class ContactManagerDialog(QDialog):
 
         rows.sort(key=_sort_key)
 
-        self.contact_table.setRowCount(0)
         self.count_label.setText(f"{len(rows)} contacts")
 
-        self.contact_table.setRowCount(len(rows))
-        for row_index, contact in enumerate(rows):
-            contact = normalize_contact_record(contact)
-            flag = str(contact.get("color_flag") or "none")
-            flag_label = CONTACT_FLAG_META.get(flag, CONTACT_FLAG_META["none"])["label"]
-            phone_text = contact.get("display_number") or contact.get("send_number") or "-"
-            row_values = [
-                flag_label,
-                contact.get("name") or "Unnamed Contact",
-                phone_text,
-                contact.get("company") or "",
-                contact.get("tags") or "",
-                make_text_preview(contact.get("summary") or "", 120),
-                format_user_datetime_text(contact.get("last_chat_at"), default="-"),
-                format_user_datetime_text(contact.get("last_outgoing_at"), default="-"),
-                format_user_datetime_text(contact.get("last_incoming_at"), default="-")
-            ]
-            for col, value in enumerate(row_values):
-                user_data = contact.get("send_number") if col == 0 else None
-                self.contact_table.setItem(row_index, col, make_table_item(value, user_data=user_data))
+        with table_update_batch(self.contact_table):
+            self.contact_table.setRowCount(0)
+            self.contact_table.setRowCount(len(rows))
+            for row_index, contact in enumerate(rows):
+                contact = normalize_contact_record(contact)
+                flag = str(contact.get("color_flag") or "none")
+                flag_label = CONTACT_FLAG_META.get(flag, CONTACT_FLAG_META["none"])["label"]
+                phone_text = contact.get("display_number") or contact.get("send_number") or "-"
+                row_values = [
+                    flag_label,
+                    contact.get("name") or "Unnamed Contact",
+                    phone_text,
+                    contact.get("company") or "",
+                    contact.get("tags") or "",
+                    make_text_preview(contact.get("summary") or "", 120),
+                    format_user_datetime_text(contact.get("last_chat_at"), default="-"),
+                    format_user_datetime_text(contact.get("last_outgoing_at"), default="-"),
+                    format_user_datetime_text(contact.get("last_incoming_at"), default="-")
+                ]
+                for col, value in enumerate(row_values):
+                    user_data = contact.get("send_number") if col == 0 else None
+                    self.contact_table.setItem(row_index, col, make_table_item(value, user_data=user_data))
 
         if self.contact_table.rowCount() > 0:
             select_first_table_row(self.contact_table)
@@ -6648,6 +8423,147 @@ class MiniBarChart(QWidget):
             )
 
 
+class MultiLineChart(QWidget):
+    def __init__(self, title="", suffix="", parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.suffix = suffix
+        self.labels = []
+        self.series = []
+        self.setMinimumHeight(260)
+        self.setStyleSheet(
+            "background:#ffffff;"
+            "border:1px solid #d4e2f7;"
+            "border-radius:22px;"
+        )
+
+    def set_data(self, labels, series, title=None, suffix=None):
+        self.labels = list(labels or [])
+        self.series = list(series or [])
+        if title is not None:
+            self.title = str(title)
+        if suffix is not None:
+            self.suffix = str(suffix)
+        self.update()
+
+    def _format_value(self, value):
+        try:
+            f = float(value)
+            if abs(f - int(f)) < 0.001:
+                return f"{int(f)}{self.suffix}"
+            return f"{f:.1f}{self.suffix}"
+        except Exception:
+            return f"{value}{self.suffix}"
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        rect = self.rect().adjusted(14, 14, -14, -14)
+
+        painter.setPen(QPen(QColor("#0d2d63")))
+        title_font = QFont()
+        title_font.setPointSize(11)
+        title_font.setBold(True)
+        painter.setFont(title_font)
+        painter.drawText(
+            rect.adjusted(0, 0, 0, -rect.height() + 22),
+            Qt.AlignmentFlag.AlignLeft,
+            self.title
+        )
+
+        chart_rect = rect.adjusted(48, 34, -16, -52)
+        if chart_rect.width() <= 0 or chart_rect.height() <= 0:
+            return
+
+        painter.setPen(QPen(QColor("#bfd0ea"), 1))
+        painter.drawLine(chart_rect.bottomLeft(), chart_rect.bottomRight())
+        painter.drawLine(chart_rect.bottomLeft(), chart_rect.topLeft())
+
+        all_values = []
+        for entry in self.series:
+            for value in entry.get("values") or []:
+                try:
+                    all_values.append(float(value))
+                except Exception:
+                    pass
+
+        if not self.labels or not all_values:
+            painter.setPen(QPen(QColor("#50688f")))
+            painter.drawText(chart_rect, Qt.AlignmentFlag.AlignCenter, "No data")
+            return
+
+        max_val = max(max(all_values), 1.0)
+        point_count = max(len(self.labels), 1)
+        step_x = 0.0 if point_count <= 1 else chart_rect.width() / float(point_count - 1)
+
+        label_font = QFont()
+        label_font.setPointSize(9)
+        painter.setFont(label_font)
+
+        for tick_index in range(4):
+            ratio = tick_index / 3.0
+            y = chart_rect.bottom() - int(ratio * chart_rect.height())
+            painter.setPen(QPen(QColor("#e3ebf8"), 1))
+            painter.drawLine(chart_rect.left(), y, chart_rect.right(), y)
+            painter.setPen(QPen(QColor("#5a7397")))
+            painter.drawText(
+                QRect(rect.left(), y - 9, 38, 18),
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                self._format_value(max_val * ratio)
+            )
+
+        for legend_index, entry in enumerate(self.series):
+            values = list(entry.get("values") or [])
+            color = QColor(str(entry.get("color") or "#2563eb"))
+            label = str(entry.get("label") or "")
+            points = []
+
+            for index, raw_value in enumerate(values[:point_count]):
+                try:
+                    value = float(raw_value)
+                except Exception:
+                    value = 0.0
+                x = chart_rect.left() + (index * step_x)
+                y = chart_rect.bottom() - ((value / max_val) * chart_rect.height())
+                points.append(QPointF(float(x), float(y)))
+
+            if not points:
+                continue
+
+            painter.setPen(QPen(color, 2))
+            if len(points) == 1:
+                painter.drawEllipse(points[0], 3, 3)
+            else:
+                painter.drawPolyline(QPolygonF(points))
+            painter.setBrush(QBrush(color))
+            painter.setPen(QPen(color, 2))
+            for point in points:
+                painter.drawEllipse(point, 3.5, 3.5)
+
+            if label:
+                legend_x = chart_rect.left() + (legend_index * 150)
+                legend_y = rect.top() + 4
+                painter.fillRect(QRect(legend_x, legend_y, 14, 8), color)
+                painter.setPen(QPen(QColor("#16335f")))
+                painter.drawText(
+                    QRect(legend_x + 20, legend_y - 4, 120, 16),
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                    label
+                )
+
+        painter.setPen(QPen(QColor("#476384")))
+        for index, label in enumerate(self.labels):
+            x = chart_rect.left() + int(index * step_x)
+            painter.drawText(
+                QRect(x - 22, chart_rect.bottom() + 10, 44, 18),
+                Qt.AlignmentFlag.AlignCenter,
+                str(label)
+            )
+
+
 class AttendanceTimelineChart(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -6775,7 +8691,7 @@ class AttendanceDialog(QDialog):
         outer_root.addWidget(scroll)
 
         content = QWidget(self)
-        content.setMinimumWidth(1020)
+        content.setMinimumWidth(900)
         root = QVBoxLayout(content)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
@@ -6835,17 +8751,13 @@ class AttendanceDialog(QDialog):
 
         self.timeline_chart = AttendanceTimelineChart(self)
         self.timeline_chart.setMinimumHeight(300)
-        self.timeline_chart.setMinimumWidth(960)
+        self.timeline_chart.setMinimumWidth(860)
         root.addWidget(self.timeline_chart)
 
-        self.active_chart = MiniBarChart("Active time - last 7 days", suffix="h", bar_color="#16a34a")
-        self.dormant_chart = MiniBarChart("Dormant time - last 7 days", suffix="h", bar_color="#dc2626")
-        self.active_chart.setMinimumHeight(250)
-        self.dormant_chart.setMinimumHeight(250)
-        self.active_chart.setMinimumWidth(960)
-        self.dormant_chart.setMinimumWidth(960)
-        root.addWidget(self.active_chart)
-        root.addWidget(self.dormant_chart)
+        self.activity_line_chart = MultiLineChart("Active vs Dormant - last 7 days", suffix="h", parent=self)
+        self.activity_line_chart.setMinimumHeight(280)
+        self.activity_line_chart.setMinimumWidth(860)
+        root.addWidget(self.activity_line_chart)
 
         segment_title = QLabel("Segments")
         segment_title.setStyleSheet("font-size:14px;font-weight:800;color:#153764;")
@@ -6854,7 +8766,7 @@ class AttendanceDialog(QDialog):
         self.segment_table = QTableWidget(0, 4, self)
         prepare_plain_table_widget(self.segment_table, ["Type", "Start", "End", "Duration"], stretch_last=False)
         self.segment_table.setMinimumHeight(280)
-        self.segment_table.setMinimumWidth(960)
+        self.segment_table.setMinimumWidth(860)
         self.segment_table.setColumnWidth(0, 110)
         self.segment_table.setColumnWidth(1, 220)
         self.segment_table.setColumnWidth(2, 220)
@@ -6865,6 +8777,13 @@ class AttendanceDialog(QDialog):
 
         self.date_edit.dateChanged.connect(self.refresh_dashboard)
         self.refresh_dashboard()
+        apply_screen_friendly_window_size(
+            self,
+            1120,
+            820,
+            min_width=900,
+            min_height=640
+        )
 
     def selected_day_key(self):
         return self.date_edit.date().toString("yyyy-MM-dd")
@@ -6905,8 +8824,15 @@ class AttendanceDialog(QDialog):
         self.timeline_chart.set_data(day_key_value, snapshot.get("segments") or [])
 
         labels = [row["date"][5:] for row in series]
-        self.active_chart.set_data(labels, [row["active_hours"] for row in series], "Active time - last 7 days", "h")
-        self.dormant_chart.set_data(labels, [row["dormant_hours"] for row in series], "Dormant time - last 7 days", "h")
+        self.activity_line_chart.set_data(
+            labels,
+            [
+                {"label": "Active", "values": [row["active_hours"] for row in series], "color": "#16a34a"},
+                {"label": "Dormant", "values": [row["dormant_hours"] for row in series], "color": "#dc2626"}
+            ],
+            "Active vs Dormant - last 7 days",
+            "h"
+        )
 
         rows = list(snapshot.get("segments") or [])
         rows = sorted(rows, key=lambda x: str(x.get("start") or ""))
@@ -7048,8 +8974,8 @@ class PerformanceDock(QDockWidget):
         root.addWidget(title)
 
         subtitle = QLabel(
-            "Heuristic dashboard based on local app logs only. "
-            "Useful for trend monitoring, not a full productivity truth source."
+            "Local activity dashboard based on app logs. "
+            "Use it to watch trends, follow-up pace, and daily consistency."
         )
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet(
@@ -7099,13 +9025,11 @@ class PerformanceDock(QDockWidget):
 
         self.sent_chart = MiniBarChart("Successful outreach - last 7 days", bar_color="#2b5fd9")
         self.screen_chart = MiniBarChart("Screen time - last 7 days", suffix="h", bar_color="#0f766e")
-        self.score_chart = MiniBarChart("Heuristic score - last 7 days", bar_color="#7c3aed")
 
         root.addWidget(self.sent_chart)
         root.addWidget(self.screen_chart)
-        root.addWidget(self.score_chart)
 
-        tips_title = QLabel("System Suggestions")
+        tips_title = QLabel("Encouragement & Suggestions")
         tips_title.setStyleSheet("font-size:15px;font-weight:800;color:#0d2d63;")
         root.addWidget(tips_title)
 
@@ -7150,7 +9074,7 @@ class PerformanceDock(QDockWidget):
         series = build_last_n_day_performance_series(7, day_key_value)
 
         summary_rows = [
-            ("Heuristic Score", f"{snapshot['productivity_score']}/100", "Local log based"),
+            ("Encouragement", snapshot.get("encouragement") or "-", "Daily guidance"),
             ("Successful Reached Out", snapshot["sent_total"], f"Failed: {snapshot['failed_total']}"),
             ("Replies Received", snapshot["received_total"], f"Reply rate: {snapshot['reply_rate']}%"),
             ("Unique Contacts", snapshot["touched_contacts_count"], f"Blast jobs: {snapshot['blast_jobs']}"),
@@ -7174,11 +9098,8 @@ class PerformanceDock(QDockWidget):
         labels = [row["date"][5:] for row in series]
         sent_values = [row["sent_total"] for row in series]
         screen_values = [row["screen_time_hours"] for row in series]
-        score_values = [row["productivity_score"] for row in series]
-
         self.sent_chart.set_data(labels, sent_values, "Successful outreach - last 7 days", "")
         self.screen_chart.set_data(labels, screen_values, "Screen time - last 7 days", "h")
-        self.score_chart.set_data(labels, score_values, "Heuristic score - last 7 days", "")
 
         tips = snapshot.get("tips") or []
         tips_text = "\n".join(f"{idx+1}. {tip}" for idx, tip in enumerate(tips))
@@ -7189,13 +9110,26 @@ class PerformanceDock(QDockWidget):
 # --------------------------
 class LockedBrowser(QMainWindow):
     live_view_request_signal = pyqtSignal(object)
+    api_bridge_request_signal = pyqtSignal(object)
     def __init__(self):
         super().__init__()
         self.apply_light_ui_theme()
         self.setWindowTitle("Locked Browser - Multi‑Service")
-        self.setGeometry(100, 100, 1200, 800)
+        apply_screen_friendly_window_size(
+            self,
+            1200,
+            800,
+            min_width=980,
+            min_height=620,
+            width_ratio=0.94,
+            height_ratio=0.92
+        )
         self.live_view_request_signal.connect(
             self._handle_live_view_request,
+            Qt.ConnectionType.QueuedConnection
+        )
+        self.api_bridge_request_signal.connect(
+            self._handle_api_bridge_request,
             Qt.ConnectionType.QueuedConnection
         )
 
@@ -7213,14 +9147,7 @@ class LockedBrowser(QMainWindow):
 
         # Proxy state
         self.proxy_enabled = False
-        self.proxy_info = {
-            "enabled": False,
-            "type": "DIRECT",
-            "host": "",
-            "port": 0,
-            "username": "",
-            "password": ""
-        }
+        self.proxy_info = load_saved_proxy_info()
 
         # Apply DIRECT first, before creating QWebEngine profiles/pages
         self.apply_proxy_config(self.proxy_info, rebuild=False)
@@ -7257,6 +9184,17 @@ class LockedBrowser(QMainWindow):
         self._wa_sync_poll_timer.setInterval(1200)
         self._wa_sync_poll_timer.setTimerType(Qt.TimerType.CoarseTimer)
         self._wa_sync_poll_timer.timeout.connect(self._poll_whatsapp_history_sync_status)
+
+        self._qc_whatsapp_poll_timer = QTimer(self)
+        self._qc_whatsapp_poll_timer.setInterval(1500)
+        self._qc_whatsapp_poll_timer.setTimerType(Qt.TimerType.CoarseTimer)
+        self._qc_whatsapp_poll_timer.timeout.connect(self._poll_qc_whatsapp_sender_status)
+
+        self._storage_maintenance_timer = QTimer(self)
+        self._storage_maintenance_timer.setInterval(STORAGE_MAINTENANCE_INTERVAL_MS)
+        self._storage_maintenance_timer.setTimerType(Qt.TimerType.CoarseTimer)
+        self._storage_maintenance_timer.timeout.connect(lambda: self.run_storage_maintenance(quiet=True))
+        self._storage_maintenance_timer.start()
 
         # Create tab widget
         self.tab_widget = QTabWidget()
@@ -7296,6 +9234,19 @@ class LockedBrowser(QMainWindow):
         self._wa_sync_total_chats = 0
         self._wa_sync_log_cache = []
         self._wa_sync_existing_signatures = set()
+        self._wa_sync_signature_index = {}
+        self._wa_sync_strict_match_index = {}
+        self._wa_sync_loose_match_index = {}
+
+        self._qc_whatsapp_jobs = {}
+        self._qc_whatsapp_active = None
+        self._qc_whatsapp_last_interaction = {}
+        self._qc_whatsapp_global_borrow_after = 0.0
+        self._qc_whatsapp_account_borrow_after = {}
+        self._qc_email_batches = {}
+        self._blocked_external_notice = {"url": "", "mono": 0.0}
+        self._active_notice_popups = []
+        self._started_at_local_text = format_system_local_timestamp()
 
         self._collection_staff_signature = ""
         self._collection_staff_records = []
@@ -7308,7 +9259,7 @@ class LockedBrowser(QMainWindow):
             [680],
             Qt.Orientation.Horizontal
         )
-        self.performance_dock.show()
+        self.performance_dock.hide()
 
         self.tab_widget.currentChanged.connect(self.on_current_tab_changed)
 
@@ -7343,6 +9294,7 @@ class LockedBrowser(QMainWindow):
 
         # Create UI
         self.create_top_bar()
+        self.update_proxy_label()
         self.apply_bulk_message_policy_ui()
         self.apply_cashier_mode_ui()
         self.create_status_bar()
@@ -7353,6 +9305,7 @@ class LockedBrowser(QMainWindow):
         self.start_local_api_server()
         self.setup_tray_icon()
         self._record_attendance_touch(force=True, source="startup")
+        QTimer.singleShot(1200, lambda: self.run_storage_maintenance(quiet=True))
 
         # Show disclaimer and load tabs
         self.show_startup_disclaimer()
@@ -7360,14 +9313,7 @@ class LockedBrowser(QMainWindow):
         self._activity_started_monotonic = time.monotonic()
 
     def default_proxy_info(self):
-        return {
-            "enabled": False,
-            "type": "DIRECT",
-            "host": "",
-            "port": 0,
-            "username": "",
-            "password": ""
-        }
+        return build_default_proxy_info()
 
 
     def apply_proxy_config(self, proxy_info, rebuild=True):
@@ -7414,6 +9360,7 @@ class LockedBrowser(QMainWindow):
                 "password": password
             }
 
+        save_saved_proxy_info(self.proxy_info)
         self.update_proxy_label()
 
         if rebuild:
@@ -7804,7 +9751,7 @@ class LockedBrowser(QMainWindow):
             raise RuntimeError("Failed to encode JPEG frame.")
 
         meta = {
-            "captured_at": datetime.datetime.now(USER_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S"),
+            "captured_at": format_system_local_timestamp(),
             "window_title": self.windowTitle(),
             "current_tab": current_tab_text,
             "current_url": current_url,
@@ -7815,6 +9762,1462 @@ class LockedBrowser(QMainWindow):
         }
 
         return bytes(byte_array), meta
+
+    def capture_qc_notification_jpeg(self, target_view=None, quality=72, max_width=1440):
+        quality = max(20, min(95, int(quality)))
+        max_width = max(320, min(2560, int(max_width)))
+
+        current_tab_text = ""
+        current_url = ""
+        pixmap = QPixmap()
+
+        if isinstance(target_view, QWebEngineView):
+            idx = self.tab_widget.indexOf(target_view)
+            if idx >= 0:
+                current_tab_text = self.tab_widget.tabText(idx)
+            current_url = target_view.url().toString()
+            pixmap = target_view.grab()
+
+        if pixmap.isNull():
+            current_widget = self.tab_widget.currentWidget()
+            if current_widget is not None:
+                idx = self.tab_widget.indexOf(current_widget)
+                if idx >= 0 and not current_tab_text:
+                    current_tab_text = self.tab_widget.tabText(idx)
+                if isinstance(current_widget, QWebEngineView) and not current_url:
+                    current_url = current_widget.url().toString()
+            pixmap = self.grab()
+
+        if pixmap.isNull():
+            raise RuntimeError("Failed to capture QC notification screenshot.")
+
+        if pixmap.width() > max_width:
+            pixmap = pixmap.scaledToWidth(
+                max_width,
+                Qt.TransformationMode.SmoothTransformation
+            )
+
+        byte_array = QByteArray()
+        buffer = QBuffer(byte_array)
+        if not buffer.open(QIODevice.OpenModeFlag.WriteOnly):
+            raise RuntimeError("Failed to open QC JPEG buffer.")
+
+        ok = pixmap.save(buffer, "JPG", quality)
+        buffer.close()
+
+        if not ok:
+            raise RuntimeError("Failed to encode QC screenshot.")
+
+        meta = {
+            "captured_at": format_system_local_timestamp(),
+            "current_tab": current_tab_text,
+            "current_url": current_url,
+            "width": pixmap.width(),
+            "height": pixmap.height(),
+            "quality": quality
+        }
+
+        return bytes(byte_array), meta
+
+    def _build_qc_whatsapp_caption(self, details):
+        timestamp_text = str(details.get("timestamp") or "-").strip() or "-"
+        from_text = str(details.get("from") or "-").strip() or "-"
+        to_text = str(details.get("to") or "-").strip() or "-"
+        send_type = str(details.get("send_type") or "-").strip() or "-"
+        status = str(details.get("status") or "-").strip() or "-"
+        trigger = str(details.get("trigger") or "-").strip() or "-"
+        preview = str(details.get("message_preview") or "").replace("\r", "").strip()
+        if len(preview) > 220:
+            preview = preview[:217] + "..."
+
+        lines = [
+            "QC WhatsApp screenshot notification",
+            f"Timestamp: {timestamp_text}",
+            f"From: {from_text}",
+            f"To: {to_text}",
+            f"Send Type: {send_type}",
+            f"Status: {status}",
+            f"Trigger: {trigger}",
+        ]
+        if preview:
+            lines.extend(["", f"Message Preview: {preview}"])
+        return "\n".join(lines)
+
+    def _save_qc_whatsapp_screenshot_file(self, screenshot_bytes):
+        if not screenshot_bytes:
+            return ""
+
+        target_dir = QC_WHATSAPP_TEMP_DIR
+        os.makedirs(target_dir, exist_ok=True)
+        file_path = os.path.join(
+            target_dir,
+            f"qc_{get_system_local_datetime().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.jpg"
+        )
+        with open(file_path, "wb") as f:
+            f.write(screenshot_bytes)
+        return file_path
+
+    def _snapshot_clipboard_state(self):
+        clipboard = QApplication.clipboard()
+        if clipboard is None:
+            return {}
+
+        snapshot = {"has_data": False}
+        try:
+            mime = clipboard.mimeData()
+        except Exception:
+            mime = None
+
+        if mime is None:
+            return snapshot
+
+        try:
+            if mime.hasText():
+                snapshot["text"] = clipboard.text()
+                snapshot["has_data"] = True
+        except Exception:
+            pass
+
+    def _get_qc_whatsapp_referenced_paths(self):
+        referenced = set()
+
+        active = self._qc_whatsapp_active or {}
+        active_path = normalize_template_attachment_path((active.get("job") or {}).get("screenshot_path"))
+        if active_path:
+            referenced.add(active_path)
+
+        for queue in (self._qc_whatsapp_jobs or {}).values():
+            for job in list(queue or []):
+                if not isinstance(job, dict):
+                    continue
+                path = normalize_template_attachment_path(job.get("screenshot_path"))
+                if path:
+                    referenced.add(path)
+
+        return referenced
+
+    def _cleanup_qc_whatsapp_orphan_files(self, max_age_seconds=QC_WHATSAPP_ORPHAN_FILE_GRACE_SECONDS):
+        target_dir = QC_WHATSAPP_TEMP_DIR
+        if not os.path.isdir(target_dir):
+            return 0
+
+        referenced = self._get_qc_whatsapp_referenced_paths()
+        now_ts = time.time()
+        removed_count = 0
+
+        for name in list(os.listdir(target_dir)):
+            file_path = os.path.join(target_dir, name)
+            if not os.path.isfile(file_path):
+                continue
+
+            normalized_path = normalize_template_attachment_path(file_path)
+            if normalized_path in referenced:
+                continue
+
+            try:
+                age_seconds = max(0.0, now_ts - os.path.getmtime(file_path))
+            except Exception:
+                age_seconds = float(max_age_seconds or 0.0)
+
+            if age_seconds < float(max_age_seconds or 0.0):
+                continue
+
+            try:
+                os.remove(file_path)
+                removed_count += 1
+            except Exception:
+                pass
+
+        return removed_count
+
+        try:
+            if mime.hasHtml():
+                snapshot["html"] = mime.html()
+                snapshot["has_data"] = True
+        except Exception:
+            pass
+
+        try:
+            if mime.hasUrls():
+                snapshot["urls"] = [url.toString() for url in mime.urls()]
+                snapshot["has_data"] = True
+        except Exception:
+            pass
+
+        try:
+            pixmap = clipboard.pixmap()
+            if not pixmap.isNull():
+                snapshot["pixmap"] = pixmap
+                snapshot["has_data"] = True
+        except Exception:
+            pass
+
+        return snapshot
+
+    def _restore_clipboard_state(self, snapshot):
+        clipboard = QApplication.clipboard()
+        if clipboard is None:
+            return
+
+        snapshot = dict(snapshot or {})
+        if not snapshot.get("has_data"):
+            try:
+                clipboard.clear()
+            except Exception:
+                pass
+            return
+
+        mime = QMimeData()
+        try:
+            if snapshot.get("html"):
+                mime.setHtml(str(snapshot.get("html") or ""))
+            if snapshot.get("text"):
+                mime.setText(str(snapshot.get("text") or ""))
+            if snapshot.get("urls"):
+                mime.setUrls([QUrl(url) for url in snapshot.get("urls") or [] if str(url or "").strip()])
+            pixmap = snapshot.get("pixmap")
+            if isinstance(pixmap, QPixmap) and not pixmap.isNull():
+                mime.setImageData(pixmap.toImage())
+            clipboard.setMimeData(mime)
+        except Exception:
+            try:
+                clipboard.clear()
+            except Exception:
+                pass
+
+    def _perform_qc_whatsapp_clipboard_paste(self, account_id):
+        active = self._qc_whatsapp_active or {}
+        if active.get("account_id") != account_id:
+            return
+
+        view = active.get("view")
+        job = active.get("job") or {}
+        if not isinstance(view, QWebEngineView):
+            self._finalize_qc_whatsapp_job(account_id, "failed", "clipboard_view_missing")
+            return
+
+        screenshot_path = normalize_template_attachment_path(job.get("screenshot_path") or "")
+        if not screenshot_path or not os.path.exists(screenshot_path):
+            self._finalize_qc_whatsapp_job(account_id, "failed", "screenshot_missing")
+            return
+
+        pixmap = QPixmap(screenshot_path)
+        if pixmap.isNull():
+            self._finalize_qc_whatsapp_job(account_id, "failed", "clipboard_image_invalid")
+            return
+
+        clipboard = QApplication.clipboard()
+        if clipboard is None:
+            self._finalize_qc_whatsapp_job(account_id, "failed", "clipboard_unavailable")
+            return
+
+        if "clipboard_snapshot" not in job:
+            job["clipboard_snapshot"] = self._snapshot_clipboard_state()
+
+        try:
+            clipboard.setPixmap(pixmap)
+        except Exception:
+            try:
+                clipboard.setImage(pixmap.toImage())
+            except Exception:
+                self._finalize_qc_whatsapp_job(account_id, "failed", "clipboard_set_failed")
+                return
+
+        try:
+            view.setFocus(Qt.FocusReason.OtherFocusReason)
+        except Exception:
+            pass
+
+        try:
+            page = view.page()
+            if isinstance(page, QWebEnginePage):
+                page.triggerAction(QWebEnginePage.WebAction.Paste)
+        except Exception as exc:
+            print("QC WhatsApp clipboard paste failed:", exc)
+            self._finalize_qc_whatsapp_job(account_id, "failed", "clipboard_paste_failed")
+            return
+
+        job["paste_attempted"] = True
+        job["paste_triggered_at"] = time.monotonic()
+
+    def _handle_qc_whatsapp_clipboard_ready(self, account_id, ready):
+        active = self._qc_whatsapp_active or {}
+        if active.get("account_id") != account_id:
+            return
+
+        job = active.get("job") or {}
+        if job.get("paste_attempted"):
+            return
+
+        if bool(ready):
+            self._perform_qc_whatsapp_clipboard_paste(account_id)
+
+    def _perform_qc_whatsapp_native_send(self, account_id):
+        active = self._qc_whatsapp_active or {}
+        if active.get("account_id") != account_id:
+            return
+
+        view = active.get("view")
+        job = active.get("job") or {}
+        if not isinstance(view, QWebEngineView):
+            return
+
+        if bool(job.get("native_send_inflight")):
+            return
+
+        job["native_send_attempts"] = int(job.get("native_send_attempts") or 0) + 1
+        job["native_send_last_mono"] = time.monotonic()
+        job["native_send_inflight"] = True
+
+        try:
+            window = view.window()
+            if isinstance(window, QWidget):
+                try:
+                    window.raise_()
+                except Exception:
+                    pass
+                try:
+                    window.activateWindow()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            view.setFocus(Qt.FocusReason.OtherFocusReason)
+        except Exception:
+            pass
+
+        QApplication.processEvents()
+
+        view.page().runJavaScript(
+            """
+            (function() {
+                const selectors = [
+                    'div[role="dialog"] button[aria-label="Send"]',
+                    'div[role="dialog"] button[aria-label*="Send"]',
+                    'div[role="dialog"] button[aria-label*="Kirim"]',
+                    'div[role="dialog"] button[data-testid="compose-btn-send"]',
+                    'div[role="dialog"] span[data-icon="send"]',
+                    'div[role="dialog"] span[data-icon="wds-ic-send-filled"]'
+                ];
+
+                function isVisible(el) {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    if (!rect || rect.width < 8 || rect.height < 8) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.visibility !== 'hidden' && style.display !== 'none';
+                }
+
+                for (const sel of selectors) {
+                    const nodes = Array.from(document.querySelectorAll(sel));
+                    for (const node of nodes) {
+                        let target = node;
+                        if (target.tagName === 'SPAN' && target.hasAttribute('data-icon')) {
+                            let parent = target.parentElement;
+                            while (parent && parent.tagName !== 'BUTTON') parent = parent.parentElement;
+                            if (parent) target = parent;
+                        }
+                        if (!isVisible(target)) continue;
+                        const rect = target.getBoundingClientRect();
+                        return JSON.stringify({
+                            x: Math.round(rect.left + (rect.width / 2)),
+                            y: Math.round(rect.top + (rect.height / 2))
+                        });
+                    }
+                }
+
+                return null;
+            })();
+            """,
+            lambda payload, account_id=account_id: self._complete_qc_whatsapp_native_send(account_id, payload)
+        )
+
+    def _complete_qc_whatsapp_native_send(self, account_id, payload):
+        active = self._qc_whatsapp_active or {}
+        if active.get("account_id") != account_id:
+            return
+
+        view = active.get("view")
+        job = active.get("job") or {}
+        if not isinstance(view, QWebEngineView):
+            return
+
+        job["native_send_inflight"] = False
+        attempt_no = int(job.get("native_send_attempts") or 0)
+
+        target_widget = view.focusProxy()
+        if not isinstance(target_widget, QWidget):
+            target_widget = view
+
+        try:
+            target_widget.setFocus(Qt.FocusReason.OtherFocusReason)
+        except Exception:
+            pass
+
+        QApplication.processEvents()
+
+        click_point = None
+        try:
+            if payload:
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
+                if isinstance(payload, dict):
+                    x = int(round(float(payload.get("x"))))
+                    y = int(round(float(payload.get("y"))))
+                    width = max(1, int(target_widget.width() or 0))
+                    height = max(1, int(target_widget.height() or 0))
+                    x = max(2, min(width - 2, x))
+                    y = max(2, min(height - 2, y))
+                    click_point = QPoint(x, y)
+        except Exception:
+            click_point = None
+
+        try:
+            if click_point is not None and attempt_no <= 1:
+                QTest.mouseClick(
+                    target_widget,
+                    Qt.MouseButton.LeftButton,
+                    Qt.KeyboardModifier.NoModifier,
+                    click_point,
+                    40
+                )
+            elif attempt_no <= 2:
+                QTest.keyClick(
+                    target_widget,
+                    Qt.Key.Key_Return,
+                    Qt.KeyboardModifier.NoModifier,
+                    40
+                )
+            else:
+                QTest.keyClick(
+                    target_widget,
+                    Qt.Key.Key_Enter,
+                    Qt.KeyboardModifier.NoModifier,
+                    40
+                )
+        except Exception:
+            pass
+
+    def _handle_qc_whatsapp_native_send_ready(self, account_id, ready):
+        active = self._qc_whatsapp_active or {}
+        if active.get("account_id") != account_id:
+            return
+
+        job = active.get("job") or {}
+        if not bool(ready):
+            return
+        if bool(job.get("native_send_inflight")):
+            return
+        if int(job.get("native_send_attempts") or 0) >= 3:
+            return
+
+        last_attempt = float(job.get("native_send_last_mono") or 0.0)
+        if last_attempt and (time.monotonic() - last_attempt) < 2.5:
+            return
+
+        self._perform_qc_whatsapp_native_send(account_id)
+
+    def _cleanup_qc_whatsapp_screenshot_file(self, file_path):
+        path = str(file_path or "").strip()
+        if not path:
+            return
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+    def _has_pending_qc_whatsapp_jobs(self):
+        return any(bool(queue) for queue in (self._qc_whatsapp_jobs or {}).values())
+
+    def _refresh_qc_whatsapp_poll_timer_state(self):
+        timer = getattr(self, "_qc_whatsapp_poll_timer", None)
+        if not isinstance(timer, QTimer):
+            return
+
+        if self._has_qc_whatsapp_active_job() or self._has_pending_qc_whatsapp_jobs():
+            desired_interval = 1500
+        elif bool(self._qc_email_batches):
+            desired_interval = QC_EMAIL_BATCH_IDLE_POLL_MS
+        else:
+            timer.stop()
+            return
+
+        if timer.interval() != desired_interval:
+            timer.setInterval(desired_interval)
+        if not timer.isActive():
+            timer.start()
+
+    def _get_qc_whatsapp_queue(self, account_id):
+        return self._qc_whatsapp_jobs.setdefault(account_id, [])
+
+    def _cleanup_qc_whatsapp_account_state(self, account_id):
+        if account_id is None:
+            return
+        queue = self._qc_whatsapp_jobs.get(account_id) or []
+        if not queue:
+            self._qc_whatsapp_jobs.pop(account_id, None)
+        if account_id not in self._qc_whatsapp_jobs:
+            self._qc_whatsapp_account_borrow_after.pop(account_id, None)
+
+    def _set_qc_whatsapp_borrow_after(self, account_id, delay_seconds):
+        if account_id is None:
+            return
+        target = time.monotonic() + max(0.0, float(delay_seconds or 0.0))
+        current = float(self._qc_whatsapp_account_borrow_after.get(account_id) or 0.0)
+        self._qc_whatsapp_account_borrow_after[account_id] = max(current, target)
+
+    def _set_qc_whatsapp_global_borrow_after(self, delay_seconds):
+        target = time.monotonic() + max(0.0, float(delay_seconds or 0.0))
+        self._qc_whatsapp_global_borrow_after = max(
+            float(self._qc_whatsapp_global_borrow_after or 0.0),
+            target
+        )
+
+    def _has_qc_whatsapp_active_job(self, account_id=None, view=None):
+        active = self._qc_whatsapp_active or {}
+        if not active:
+            return False
+        if account_id is not None and active.get("account_id") != account_id:
+            return False
+        if view is not None and active.get("view") is not view:
+            return False
+        return True
+
+    def _is_account_busy_for_qc_whatsapp(self, account_id):
+        if account_id is None:
+            return True
+        if self._bulk_processing or self._bulk_queue:
+            return True
+        if self._wa_sync_processing:
+            return True
+        if self._has_qc_whatsapp_active_job():
+            return True
+        return False
+
+    def _build_qc_whatsapp_borrow_overlay_html(self, account_id, job):
+        label = self._format_whatsapp_label(account_id)
+        qc_number = format_contact_display_number(job.get("number"))
+        original_to = str(job.get("original_to") or "-").strip() or "-"
+        created_at = str(job.get("created_at") or "-").strip() or "-"
+        attempts = int(job.get("attempts") or 0)
+        return f"""
+        <div style="
+            background: rgba(18,18,18,0.92);
+            color: white;
+            font-family: Arial, sans-serif;
+            font-size: 12px;
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+            padding: 14px;
+            border: 1px solid rgba(255,255,255,0.10);
+            max-width: 420px;
+        ">
+            <div style="font-size:14px;font-weight:700;margin-bottom:8px;">
+                PT Pendanaan Teknologi Nusa
+            </div>
+            <div style="margin-bottom:8px;color:#ffd966;font-weight:700;">
+                This tab is temporarily borrowed by bot for QC WhatsApp forwarding.
+            </div>
+            <div style="line-height:1.6;">
+                <div><b>Sender tab:</b> {label}</div>
+                <div><b>QC number:</b> {qc_number}</div>
+                <div><b>Original recipient:</b> {original_to}</div>
+                <div><b>Queued at:</b> {created_at}</div>
+                <div><b>Attempt:</b> {attempts}</div>
+            </div>
+        </div>
+        """
+
+    def _render_qc_whatsapp_borrow_overlay(self, view, account_id, job):
+        if not isinstance(view, QWebEngineView):
+            return
+
+        html = self._build_qc_whatsapp_borrow_overlay_html(account_id, job)
+        js = f"""
+        (function() {{
+            const overlayId = "__ptn_qc_whatsapp_overlay";
+            let overlay = document.getElementById(overlayId);
+
+            if (!overlay) {{
+                overlay = document.createElement("div");
+                overlay.id = overlayId;
+                overlay.tabIndex = 0;
+                overlay.style.position = "fixed";
+                overlay.style.inset = "0";
+                overlay.style.zIndex = "2147483647";
+                overlay.style.background = "rgba(0,0,0,0.08)";
+                overlay.style.pointerEvents = "auto";
+                overlay.style.display = "flex";
+                overlay.style.alignItems = "flex-start";
+                overlay.style.justifyContent = "flex-end";
+                overlay.style.padding = "12px";
+                overlay.style.boxSizing = "border-box";
+                overlay.style.cursor = "not-allowed";
+                overlay.style.outline = "none";
+
+                const block = function(e) {{
+                    e.preventDefault();
+                    e.stopPropagation();
+                    e.stopImmediatePropagation();
+                    return false;
+                }};
+
+                ["click", "dblclick", "mousedown", "mouseup", "contextmenu", "wheel",
+                "touchstart", "touchmove", "keydown", "keyup", "keypress", "paste", "drop"]
+                .forEach(function(evt) {{
+                    overlay.addEventListener(evt, block, true);
+                }});
+
+                document.body.appendChild(overlay);
+            }}
+
+            overlay.innerHTML = {json.dumps(html)};
+
+            if (document.activeElement && typeof document.activeElement.blur === "function") {{
+                try {{ document.activeElement.blur(); }} catch (e) {{}}
+            }}
+
+            try {{ overlay.focus(); }} catch (e) {{}}
+        }})();
+        """
+        view.page().runJavaScript(js)
+
+    def _clear_qc_whatsapp_borrow_overlay(self, view):
+        if not isinstance(view, QWebEngineView):
+            return
+        try:
+            view.page().runJavaScript("""
+            (function() {
+                const overlay = document.getElementById("__ptn_qc_whatsapp_overlay");
+                if (overlay) overlay.remove();
+            })();
+            """)
+        except Exception:
+            pass
+
+    def _defer_qc_whatsapp_sender_for_account(self, account_id):
+        if account_id is None:
+            return
+
+        self._set_qc_whatsapp_borrow_after(account_id, QC_WHATSAPP_BORROW_IDLE_SECONDS)
+
+        active = self._qc_whatsapp_active or {}
+        if active.get("account_id") != account_id:
+            return
+
+        job = active.get("job") or {}
+        stage = str(job.get("stage") or "").strip().lower()
+        if stage == "running":
+            return
+
+        retry_job = dict(job)
+        retry_job["stage"] = "queued"
+        retry_job["started_at"] = 0.0
+        retry_job["run_started_at"] = 0.0
+        retry_job["not_before_mono"] = max(
+            float(retry_job.get("not_before_mono") or 0.0),
+            time.monotonic() + QC_WHATSAPP_BORROW_IDLE_SECONDS
+        )
+        self._get_qc_whatsapp_queue(account_id).insert(0, retry_job)
+
+        try:
+            active["view"].loadFinished.disconnect(self._on_qc_whatsapp_sender_load)
+        except Exception:
+            pass
+        try:
+            page = active["view"].page()
+            if hasattr(page, "auto_file_chooser_path"):
+                page.auto_file_chooser_path = ""
+        except Exception:
+            pass
+        try:
+            active["view"].stop()
+        except Exception:
+            pass
+        try:
+            active["view"].page().runJavaScript(
+                "(function(){ window.__waAutoSendState = null; window.__ptnQcSenderMode = false; })();"
+            )
+        except Exception:
+            pass
+        self._clear_qc_whatsapp_borrow_overlay(active.get("view"))
+        self._qc_whatsapp_active = None
+        self._refresh_qc_whatsapp_poll_timer_state()
+
+    def _drop_qc_whatsapp_jobs_for_account(self, account_id, reason="removed"):
+        if account_id is None:
+            return 0
+
+        removed_jobs = self._qc_whatsapp_jobs.pop(account_id, []) or []
+        removed_count = 0
+        for job in removed_jobs:
+            if not isinstance(job, dict):
+                continue
+            removed_count += 1
+            self._cleanup_qc_whatsapp_screenshot_file(job.get("screenshot_path"))
+            save_history({
+                "timestamp": format_system_local_timestamp(),
+                "event": "qc_whatsapp_notification",
+                "tab": self._format_whatsapp_label(account_id),
+                "qc_number": str(job.get("number") or ""),
+                "status": "dropped",
+                "from": str(job.get("from") or ""),
+                "to": str(job.get("original_to") or ""),
+                "attempts": int(job.get("attempts") or 0),
+                "retry_queued": False,
+                "error": str(reason or "")
+            })
+
+        self._qc_whatsapp_account_borrow_after.pop(account_id, None)
+        self._cleanup_qc_whatsapp_orphan_files()
+        self._refresh_qc_whatsapp_poll_timer_state()
+        return removed_count
+
+    def _iter_qc_whatsapp_ready_jobs(self):
+        now_mono = time.monotonic()
+        ready = []
+
+        for account_id, queue in list(self._qc_whatsapp_jobs.items()):
+            queue = [job for job in (queue or []) if isinstance(job, dict)]
+            if not queue:
+                self._qc_whatsapp_jobs.pop(account_id, None)
+                self._qc_whatsapp_account_borrow_after.pop(account_id, None)
+                continue
+
+            self._qc_whatsapp_jobs[account_id] = queue
+
+            if self._is_account_busy_for_qc_whatsapp(account_id):
+                continue
+            if now_mono < float(self._qc_whatsapp_global_borrow_after or 0.0):
+                continue
+            if now_mono < float(self._qc_whatsapp_account_borrow_after.get(account_id) or 0.0):
+                continue
+
+            last_interaction = float(self._qc_whatsapp_last_interaction.get(account_id) or 0.0)
+            if last_interaction and (now_mono - last_interaction) < QC_WHATSAPP_BORROW_IDLE_SECONDS:
+                continue
+
+            job = queue[0]
+            if now_mono < float(job.get("not_before_mono") or 0.0):
+                continue
+
+            ready.append((
+                float(job.get("queued_at_mono") or now_mono),
+                account_id,
+                job
+            ))
+
+        ready.sort(key=lambda item: item[0])
+        return ready
+
+    def _start_next_qc_whatsapp_job(self):
+        if self._has_qc_whatsapp_active_job():
+            return False
+
+        ready_jobs = self._iter_qc_whatsapp_ready_jobs()
+        if not ready_jobs:
+            self._refresh_qc_whatsapp_poll_timer_state()
+            return False
+
+        _, account_id, job = ready_jobs[0]
+        queue = self._get_qc_whatsapp_queue(account_id)
+        if not queue:
+            self._cleanup_qc_whatsapp_account_state(account_id)
+            return False
+
+        queue.pop(0)
+        if not os.path.exists(str(job.get("screenshot_path") or "")):
+            save_history({
+                "timestamp": format_system_local_timestamp(),
+                "event": "qc_whatsapp_notification",
+                "tab": self._format_whatsapp_label(account_id),
+                "qc_number": str(job.get("number") or ""),
+                "status": "failed",
+                "from": str(job.get("from") or ""),
+                "to": str(job.get("original_to") or ""),
+                "attempts": int(job.get("attempts") or 0),
+                "retry_queued": False,
+                "error": "screenshot_missing"
+            })
+            self._cleanup_qc_whatsapp_account_state(account_id)
+            return self._start_next_qc_whatsapp_job()
+
+        tab = self.find_whatsapp_tab_by_account_id(account_id)
+        if not tab:
+            self._cleanup_qc_whatsapp_screenshot_file(job.get("screenshot_path"))
+            save_history({
+                "timestamp": format_system_local_timestamp(),
+                "event": "qc_whatsapp_notification",
+                "tab": self._format_whatsapp_label(account_id),
+                "qc_number": str(job.get("number") or ""),
+                "status": "failed",
+                "from": str(job.get("from") or ""),
+                "to": str(job.get("original_to") or ""),
+                "attempts": int(job.get("attempts") or 0),
+                "retry_queued": False,
+                "error": "tab_missing"
+            })
+            self._cleanup_qc_whatsapp_account_state(account_id)
+            return self._start_next_qc_whatsapp_job()
+
+        job["attempts"] = int(job.get("attempts") or 0) + 1
+        job["stage"] = "loading"
+        job["started_at"] = time.monotonic()
+        job["run_started_at"] = 0.0
+
+        view = tab["view"]
+        self._qc_whatsapp_active = {
+            "account_id": account_id,
+            "view": view,
+            "job": job
+        }
+
+        try:
+            view.loadFinished.disconnect(self._on_qc_whatsapp_sender_load)
+        except Exception:
+            pass
+        view.loadFinished.connect(self._on_qc_whatsapp_sender_load)
+        self._render_qc_whatsapp_borrow_overlay(view, account_id, job)
+
+        try:
+            page = view.page()
+            if hasattr(page, "auto_file_chooser_path"):
+                page.auto_file_chooser_path = ""
+        except Exception:
+            pass
+
+        try:
+            view.page().runJavaScript(
+                "(function(){ window.__ptnQcSenderMode = true; window.__waAutoSendState = null; })();"
+            )
+        except Exception:
+            pass
+
+        view.setUrl(QUrl(f"https://web.whatsapp.com/send?phone={job['number']}"))
+        self._cleanup_qc_whatsapp_account_state(account_id)
+        self._refresh_qc_whatsapp_poll_timer_state()
+        return True
+
+    def _inject_qc_whatsapp_active_job(self):
+        active = self._qc_whatsapp_active or {}
+        job = active.get("job") or {}
+        view = active.get("view")
+        account_id = active.get("account_id")
+
+        if not account_id or not isinstance(view, QWebEngineView):
+            return
+        if str(job.get("stage") or "").strip().lower() != "loading":
+            return
+        if not os.path.exists(str(job.get("screenshot_path") or "")):
+            self._finalize_qc_whatsapp_job(account_id, "failed", "screenshot_missing")
+            return
+
+        job["paste_attempted"] = False
+        job["paste_triggered_at"] = 0.0
+        job["native_send_attempts"] = 0
+        job["native_send_last_mono"] = 0.0
+        job["native_send_inflight"] = False
+
+        self.inject_whatsapp_qc_auto_send(
+            view,
+            str(job.get("caption") or "")
+        )
+        job["stage"] = "running"
+        job["run_started_at"] = time.monotonic()
+        self._render_qc_whatsapp_borrow_overlay(view, account_id, job)
+
+    def _on_qc_whatsapp_sender_load(self, ok):
+        active = self._qc_whatsapp_active or {}
+        view = self.sender()
+        if not isinstance(view, QWebEngineView):
+            return
+        if active.get("view") is not view:
+            return
+
+        account_id = active.get("account_id")
+        job = active.get("job") or {}
+        if str(job.get("stage") or "").strip().lower() != "loading":
+            return
+
+        if not ok:
+            self._finalize_qc_whatsapp_job(account_id, "failed", "load_failed")
+            return
+
+        self._inject_qc_whatsapp_active_job()
+
+    def _finalize_qc_whatsapp_job(self, account_id, status, error_text=""):
+        active = self._qc_whatsapp_active or {}
+        if active.get("account_id") != account_id:
+            return
+
+        view = active.get("view")
+        job = active.get("job") or {}
+        screenshot_path = str(job.get("screenshot_path") or "")
+        should_retry = (
+            status != "sent"
+            and int(job.get("attempts") or 0) < 2
+            and screenshot_path
+            and os.path.exists(screenshot_path)
+        )
+
+        if should_retry:
+            retry_job = dict(job)
+            retry_job["stage"] = "queued"
+            retry_job["started_at"] = 0.0
+            retry_job["run_started_at"] = 0.0
+            retry_job["not_before_mono"] = time.monotonic() + QC_WHATSAPP_BORROW_IDLE_SECONDS
+            retry_job["queued_at_mono"] = time.monotonic()
+            self._get_qc_whatsapp_queue(account_id).insert(0, retry_job)
+
+        save_history({
+            "timestamp": format_system_local_timestamp(),
+            "event": "qc_whatsapp_notification",
+            "tab": self._format_whatsapp_label(account_id),
+            "qc_number": str(job.get("number") or ""),
+            "status": status,
+            "from": str(job.get("from") or ""),
+            "to": str(job.get("original_to") or ""),
+            "attempts": int(job.get("attempts") or 0),
+            "retry_queued": bool(should_retry),
+            "error": str(error_text or "")
+        })
+
+        self._restore_clipboard_state(job.get("clipboard_snapshot"))
+
+        if not should_retry:
+            self._cleanup_qc_whatsapp_screenshot_file(screenshot_path)
+
+        try:
+            if isinstance(view, QWebEngineView):
+                view.loadFinished.disconnect(self._on_qc_whatsapp_sender_load)
+        except Exception:
+            pass
+        try:
+            if isinstance(view, QWebEngineView):
+                page = view.page()
+                if hasattr(page, "auto_file_chooser_path"):
+                    page.auto_file_chooser_path = ""
+                page.runJavaScript(
+                    "(function(){ window.__waAutoSendState = null; window.__ptnQcSenderMode = false; })();"
+                )
+        except Exception:
+            pass
+
+        self._clear_qc_whatsapp_borrow_overlay(view)
+        self._qc_whatsapp_active = None
+        self._cleanup_qc_whatsapp_account_state(account_id)
+        self._cleanup_qc_whatsapp_orphan_files()
+        self._refresh_qc_whatsapp_poll_timer_state()
+
+    def _handle_qc_whatsapp_sender_status(self, result):
+        active = self._qc_whatsapp_active or {}
+        account_id = active.get("account_id")
+        job = active.get("job") or {}
+        if not account_id or str(job.get("stage") or "").strip().lower() != "running":
+            return
+
+        if not result:
+            return
+
+        try:
+            state = json.loads(result)
+        except Exception:
+            return
+
+        status = str(state.get("status") or "").strip().lower()
+        if status == "running" or not status:
+            return
+
+        if status == "sent":
+            self._finalize_qc_whatsapp_job(account_id, "sent", "")
+        else:
+            self._finalize_qc_whatsapp_job(
+                account_id,
+                "failed",
+                str(state.get("error") or "unknown")
+            )
+
+    def _poll_qc_whatsapp_sender_status(self):
+        active = self._qc_whatsapp_active or {}
+        if not active:
+            self._poll_qc_email_batches()
+            self._start_next_qc_whatsapp_job()
+            self._refresh_qc_whatsapp_poll_timer_state()
+            return
+
+        account_id = active.get("account_id")
+        view = active.get("view")
+        job = active.get("job") or {}
+        stage = str(job.get("stage") or "").strip().lower()
+
+        if not account_id or not isinstance(view, QWebEngineView):
+            self._qc_whatsapp_active = None
+            self._refresh_qc_whatsapp_poll_timer_state()
+            return
+
+        if self.find_tab_meta_by_view(view) is None:
+            self._finalize_qc_whatsapp_job(account_id, "failed", "tab_closed")
+            return
+
+        age_sec = time.monotonic() - float(job.get("started_at") or time.monotonic())
+        if stage == "loading":
+            if age_sec > 60:
+                self._finalize_qc_whatsapp_job(account_id, "failed", "load_timeout")
+            return
+
+        if stage != "running":
+            return
+
+        run_started_at = float(job.get("run_started_at") or job.get("started_at") or time.monotonic())
+        if time.monotonic() - run_started_at > 180:
+            self._finalize_qc_whatsapp_job(account_id, "failed", "send_timeout")
+            return
+
+        if not bool(job.get("paste_attempted")):
+            view.page().runJavaScript(
+                """
+                (function() {
+                    return !!window.__ptnQcClipboardReady;
+                })();
+                """,
+                lambda ready, account_id=account_id: self._handle_qc_whatsapp_clipboard_ready(account_id, ready)
+            )
+
+        if int(job.get("native_send_attempts") or 0) < 3 and not bool(job.get("native_send_inflight")):
+            view.page().runJavaScript(
+                """
+                (function() {
+                    return !!window.__ptnQcNativeSendReady;
+                })();
+                """,
+                lambda ready, account_id=account_id: self._handle_qc_whatsapp_native_send_ready(account_id, ready)
+            )
+
+        view.page().runJavaScript(
+            """
+            (function() {
+                if (!window.__waAutoSendState) return null;
+                return JSON.stringify(window.__waAutoSendState);
+            })();
+            """,
+            self._handle_qc_whatsapp_sender_status
+        )
+        self._poll_qc_email_batches()
+        self._refresh_qc_whatsapp_poll_timer_state()
+
+    def _get_qc_email_batch_key(self, account_id=None, details=None):
+        details = dict(details or {})
+        if account_id is not None:
+            return f"wa_account_{account_id}"
+
+        label = str(details.get("current_tab") or details.get("from") or "whatsapp").strip() or "whatsapp"
+        return f"wa_label_{label.lower()}"
+
+    def _queue_qc_email_batch_entry(self, recipients, account_id, details, screenshot_bytes):
+        recipients = normalize_qc_email_list(recipients)
+        if not recipients:
+            return
+
+        details = dict(details or {})
+        batch_key = self._get_qc_email_batch_key(account_id=account_id, details=details)
+        batch = self._qc_email_batches.setdefault(
+            batch_key,
+            {
+                "account_id": account_id,
+                "account_label": self._format_whatsapp_label(account_id) if account_id is not None else str(details.get("current_tab") or details.get("from") or "WhatsApp"),
+                "recipients": recipients,
+                "items": [],
+                "last_item_mono": 0.0
+            }
+        )
+
+        batch["recipients"] = recipients
+        batch["account_label"] = str(batch.get("account_label") or self._format_whatsapp_label(account_id)).strip() or self._format_whatsapp_label(account_id)
+
+        timestamp_text = str(details.get("timestamp") or format_system_local_timestamp()).strip() or format_system_local_timestamp()
+        to_text = str(details.get("to") or "recipient").strip() or "recipient"
+        safe_ts = re.sub(r"[^0-9A-Za-z_-]+", "_", timestamp_text)
+        safe_to = re.sub(r"[^0-9A-Za-z_-]+", "_", to_text)[:48].strip("_") or "recipient"
+
+        batch["items"].append({
+            "details": details,
+            "screenshot_bytes": screenshot_bytes,
+            "queued_at_mono": time.monotonic(),
+            "attachment_name": f"{len(batch['items']) + 1:02d}_{safe_ts}_{safe_to}.jpg"
+        })
+        batch["last_item_mono"] = time.monotonic()
+
+        while len(batch["items"]) >= QC_EMAIL_BATCH_SIZE:
+            self._flush_qc_email_batch(batch_key, force=False)
+
+        self._refresh_qc_whatsapp_poll_timer_state()
+
+    def _flush_qc_email_batch(self, batch_key, force=False):
+        batch = self._qc_email_batches.get(batch_key)
+        if not batch:
+            return False
+
+        items = list(batch.get("items") or [])
+        if not items:
+            self._qc_email_batches.pop(batch_key, None)
+            return False
+
+        if force:
+            send_items = items
+            remaining_items = []
+        else:
+            if len(items) < QC_EMAIL_BATCH_SIZE:
+                return False
+            send_items = items[:QC_EMAIL_BATCH_SIZE]
+            remaining_items = items[QC_EMAIL_BATCH_SIZE:]
+
+        recipients = list(batch.get("recipients") or [])
+        account_label = str(batch.get("account_label") or "WhatsApp").strip() or "WhatsApp"
+        batch["items"] = remaining_items
+
+        if not remaining_items:
+            self._qc_email_batches.pop(batch_key, None)
+
+        def worker():
+            try:
+                send_qc_notification_email_batch(recipients, account_label, send_items)
+            except Exception as exc:
+                print("Failed to send QC notification email batch:", exc)
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._refresh_qc_whatsapp_poll_timer_state()
+        return True
+
+    def _poll_qc_email_batches(self):
+        now_mono = time.monotonic()
+        for batch_key in list(self._qc_email_batches.keys()):
+            batch = self._qc_email_batches.get(batch_key) or {}
+            items = list(batch.get("items") or [])
+            if not items:
+                self._qc_email_batches.pop(batch_key, None)
+                continue
+
+            if len(items) >= QC_EMAIL_BATCH_SIZE:
+                while self._flush_qc_email_batch(batch_key, force=False):
+                    pass
+                continue
+
+            last_item_mono = float(batch.get("last_item_mono") or items[-1].get("queued_at_mono") or now_mono)
+            if (now_mono - last_item_mono) >= QC_EMAIL_BATCH_MAX_WAIT_SECONDS:
+                self._flush_qc_email_batch(batch_key, force=True)
+
+    def run_storage_maintenance(self, quiet=True):
+        removed = {
+            "history": 0,
+            "manual_send": 0,
+            "network": 0,
+            "activity_days": 0,
+            "bad_word_days": 0,
+            "qc_temp_files": 0,
+            "profile_cache_files": 0
+        }
+
+        try:
+            history_items, removed["history"] = prune_items_older_than(
+                load_history(),
+                timestamp_keys=("timestamp", "ts", "updated_at"),
+                days=LOCAL_DATA_RETENTION_DAYS
+            )
+            if removed["history"] > 0:
+                with open(HISTORY_FILE, "wb") as f:
+                    f.write(encrypt_data(history_items))
+        except Exception as exc:
+            print("Storage maintenance: history prune failed:", exc)
+
+        try:
+            manual_logs, removed["manual_send"] = prune_items_older_than(
+                load_manual_send_log(),
+                timestamp_keys=("timestamp", "ts"),
+                days=LOCAL_DATA_RETENTION_DAYS
+            )
+            if removed["manual_send"] > 0:
+                write_manual_send_log(manual_logs)
+        except Exception as exc:
+            print("Storage maintenance: manual send prune failed:", exc)
+
+        try:
+            network_logs, removed["network"] = prune_items_older_than(
+                load_network_log(),
+                timestamp_keys=("timestamp", "ts", "captured_at"),
+                days=LOCAL_DATA_RETENTION_DAYS
+            )
+            if removed["network"] > 0:
+                with open(NETWORK_LOG_FILE, "wb") as f:
+                    f.write(encrypt_data(network_logs))
+        except Exception as exc:
+            print("Storage maintenance: network prune failed:", exc)
+
+        try:
+            activity_data = load_activity_stats()
+            kept_days, removed_days = prune_day_map_older_than(
+                activity_data.get("days", {}),
+                days=LOCAL_DATA_RETENTION_DAYS
+            )
+            removed["activity_days"] = removed_days
+            if removed_days > 0:
+                activity_data["days"] = kept_days
+                save_activity_stats(activity_data)
+        except Exception as exc:
+            print("Storage maintenance: activity prune failed:", exc)
+
+        try:
+            bad_word_data = load_bad_word_counter()
+            kept_days, removed_days = prune_day_map_older_than(
+                bad_word_data.get("days", {}),
+                days=LOCAL_DATA_RETENTION_DAYS
+            )
+            removed["bad_word_days"] = removed_days
+            if removed_days > 0:
+                bad_word_data["days"] = kept_days
+                save_bad_word_counter(bad_word_data)
+        except Exception as exc:
+            print("Storage maintenance: bad-word prune failed:", exc)
+
+        try:
+            removed["qc_temp_files"] = self._cleanup_qc_whatsapp_orphan_files()
+        except Exception as exc:
+            print("Storage maintenance: QC temp cleanup failed:", exc)
+
+        try:
+            cutoff_epoch = time.time() - (LOCAL_DATA_RETENTION_DAYS * 24 * 60 * 60)
+            if os.path.isdir(PROFILE_BASE_DIR):
+                for entry in os.scandir(PROFILE_BASE_DIR):
+                    if not entry.is_dir():
+                        continue
+                    cache_dir = os.path.join(entry.path, "cache")
+                    if not os.path.isdir(cache_dir):
+                        continue
+                    for root, dirs, files in os.walk(cache_dir, topdown=False):
+                        for filename in files:
+                            file_path = os.path.join(root, filename)
+                            try:
+                                if os.path.getmtime(file_path) <= cutoff_epoch:
+                                    os.remove(file_path)
+                                    removed["profile_cache_files"] += 1
+                            except Exception:
+                                pass
+                        for dirname in dirs:
+                            dir_path = os.path.join(root, dirname)
+                            try:
+                                if not os.listdir(dir_path):
+                                    os.rmdir(dir_path)
+                            except Exception:
+                                pass
+        except Exception as exc:
+            print("Storage maintenance: profile cache cleanup failed:", exc)
+
+        total_removed = sum(int(value or 0) for value in removed.values())
+        if total_removed:
+            try:
+                self.refresh_performance_dock()
+            except Exception:
+                pass
+        if total_removed and not quiet and hasattr(self, "status_bar"):
+            self.status_bar.showMessage(
+                f"Storage maintenance cleaned {total_removed} old item(s).",
+                5000
+            )
+        return removed
+
+    def queue_qc_send_notification(self, payload, target_view=None, account_id=None):
+        recipients = get_qc_notification_emails()
+        qc_numbers = get_qc_whatsapp_numbers()
+        if not recipients and not qc_numbers:
+            return
+
+        payload = dict(payload or {})
+        if account_id is None:
+            account_id = payload.get("account_id")
+        if account_id is None and isinstance(target_view, QWebEngineView):
+            meta = self.find_tab_meta_by_view(target_view)
+            if meta and meta.get("name") == "WhatsApp":
+                account_id = meta.get("account_id")
+
+        screenshot_bytes = None
+        screenshot_meta = {}
+
+        try:
+            screenshot_bytes, screenshot_meta = self.capture_qc_notification_jpeg(target_view=target_view)
+        except Exception as exc:
+            screenshot_meta = {"capture_error": str(exc)}
+
+        details = {
+            "timestamp": str(payload.get("timestamp") or format_system_local_timestamp()),
+            "from": str(payload.get("from") or ""),
+            "to": str(payload.get("to") or ""),
+            "send_type": str(payload.get("send_type") or ""),
+            "status": str(payload.get("status") or ""),
+            "trigger": str(payload.get("trigger") or ""),
+            "message_preview": str(payload.get("content") or ""),
+            "current_tab": str(screenshot_meta.get("current_tab") or ""),
+            "current_url": str(screenshot_meta.get("current_url") or ""),
+            "capture_error": str(screenshot_meta.get("capture_error") or "")
+        }
+
+        if recipients:
+            self._queue_qc_email_batch_entry(
+                recipients,
+                account_id,
+                details,
+                screenshot_bytes
+            )
+
+        if qc_numbers and screenshot_bytes and account_id is not None:
+            caption = self._build_qc_whatsapp_caption(details)
+            for qc_number in qc_numbers:
+                try:
+                    screenshot_path = self._save_qc_whatsapp_screenshot_file(screenshot_bytes)
+                except Exception as exc:
+                    print("Failed to prepare QC WhatsApp screenshot file:", exc)
+                    continue
+                self._get_qc_whatsapp_queue(account_id).append({
+                    "account_id": account_id,
+                    "number": qc_number,
+                    "caption": caption,
+                    "screenshot_path": screenshot_path,
+                    "from": str(details.get("from") or ""),
+                    "original_to": str(details.get("to") or ""),
+                    "attempts": 0,
+                    "stage": "queued",
+                    "created_at": format_system_local_timestamp(),
+                    "queued_at_mono": time.monotonic(),
+                    "not_before_mono": time.monotonic() + QC_WHATSAPP_BORROW_IDLE_SECONDS
+                })
+            self._refresh_qc_whatsapp_poll_timer_state()
+
+    def configure_qc_notification_emails(self):
+        if not self.require_admin_password():
+            QMessageBox.warning(self, "Error", "Incorrect password.")
+            return
+
+        current_emails = get_qc_notification_emails()
+        text, ok = QInputDialog.getMultiLineText(
+            self,
+            "QC Notification Emails",
+            f"Enter up to {QC_NOTIFICATION_MAX_EMAILS} QC email addresses.\nOne per line or separated by comma. Leave blank to disable:",
+            "\n".join(current_emails)
+        )
+        if not ok:
+            return
+
+        raw_entries = split_email_candidates(text)
+        if len({item.strip().lower() for item in raw_entries if item.strip()}) > QC_NOTIFICATION_MAX_EMAILS:
+            QMessageBox.warning(
+                self,
+                "Too Many Emails",
+                f"You can store at most {QC_NOTIFICATION_MAX_EMAILS} QC email addresses."
+            )
+            return
+
+        invalid_entries = [
+            item for item in raw_entries
+            if not EMAIL_ADDRESS_RE.match(item.strip())
+        ]
+        if invalid_entries:
+            QMessageBox.warning(
+                self,
+                "Invalid Email",
+                "These email addresses are invalid:\n" + "\n".join(invalid_entries)
+            )
+            return
+
+        cleaned = normalize_qc_email_list(raw_entries)
+        set_qc_notification_emails(cleaned)
+
+        if cleaned:
+            QMessageBox.information(
+                self,
+                "QC Emails Saved",
+                f"Saved {len(cleaned)} QC email address(es)."
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "QC Emails Disabled",
+                "QC email notifications have been disabled."
+            )
+
+    def configure_qc_whatsapp_numbers(self):
+        if not self.require_admin_password():
+            QMessageBox.warning(self, "Error", "Incorrect password.")
+            return
+
+        current_numbers = get_qc_whatsapp_numbers()
+        display_lines = [format_contact_display_number(x) for x in current_numbers]
+        text, ok = QInputDialog.getMultiLineText(
+            self,
+            "QC WhatsApp Numbers",
+            f"Enter up to {QC_NOTIFICATION_MAX_WHATSAPP} QC WhatsApp numbers.\nOne per line or separated by comma. Leave blank to disable:",
+            "\n".join(display_lines)
+        )
+        if not ok:
+            return
+
+        raw_entries = split_email_candidates(text)
+        normalized_entries = []
+        invalid_entries = []
+        seen = set()
+
+        for item in raw_entries:
+            raw = str(item or "").strip()
+            if not raw:
+                continue
+
+            send_number, _ = normalize_indonesia_mobile(raw)
+            if not send_number:
+                digits = normalize_phone_number(raw).lstrip("+")
+                if digits.startswith("0"):
+                    digits = "62" + digits[1:]
+                if len(digits) >= 8:
+                    send_number = digits
+
+            if not send_number:
+                invalid_entries.append(raw)
+                continue
+
+            if send_number in seen:
+                continue
+            seen.add(send_number)
+            normalized_entries.append(send_number)
+
+        if len(normalized_entries) > QC_NOTIFICATION_MAX_WHATSAPP:
+            QMessageBox.warning(
+                self,
+                "Too Many Numbers",
+                f"You can store at most {QC_NOTIFICATION_MAX_WHATSAPP} QC WhatsApp numbers."
+            )
+            return
+
+        if invalid_entries:
+            QMessageBox.warning(
+                self,
+                "Invalid Number",
+                "These WhatsApp numbers are invalid:\n" + "\n".join(invalid_entries)
+            )
+            return
+
+        set_qc_whatsapp_numbers(normalized_entries)
+
+        if normalized_entries:
+            QMessageBox.information(
+                self,
+                "QC WhatsApp Numbers Saved",
+                f"Saved {len(normalized_entries)} QC WhatsApp number(s)."
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "QC WhatsApp Disabled",
+                "QC WhatsApp notifications have been disabled."
+            )
 
     def is_custom_bulk_message_enabled(self):
         return bool(load_app_state().get("allow_custom_bulk_message", False))
@@ -8110,6 +11513,31 @@ class LockedBrowser(QMainWindow):
         except Exception:
             pass
 
+    def _record_whatsapp_tab_interaction(self, account_id=None, view=None, source="interaction"):
+        try:
+            if account_id is None and isinstance(view, QWebEngineView):
+                meta = self.find_tab_meta_by_view(view)
+                if meta and meta.get("name") == "WhatsApp":
+                    account_id = meta.get("account_id")
+
+            if account_id is None:
+                current = self.tab_widget.currentWidget()
+                if isinstance(current, QWebEngineView):
+                    meta = self.find_tab_meta_by_view(current)
+                    if meta and meta.get("name") == "WhatsApp":
+                        account_id = meta.get("account_id")
+
+            if account_id is None:
+                return
+
+            active = self._qc_whatsapp_active or {}
+            if active and active.get("account_id") == account_id:
+                return
+
+            self._qc_whatsapp_last_interaction[account_id] = time.monotonic()
+        except Exception:
+            pass
+
 
     def eventFilter(self, obj, event):
         try:
@@ -8137,6 +11565,7 @@ class LockedBrowser(QMainWindow):
                 source = tracked_sources.get(event_type)
                 if source:
                     self._record_attendance_touch(source=source)
+                    self._record_whatsapp_tab_interaction(source=source)
         except Exception:
             pass
 
@@ -8148,6 +11577,10 @@ class LockedBrowser(QMainWindow):
         if isinstance(current, QWebEngineView):
             meta = self.find_tab_meta_by_view(current)
             if meta and meta.get("name") == "WhatsApp":
+                self._record_whatsapp_tab_interaction(
+                    account_id=meta.get("account_id"),
+                    source="tab_change"
+                )
                 QTimer.singleShot(500, lambda v=current: self.refresh_whatsapp_identity_for_view(v))
 
         self._record_attendance_touch(source="tab_change")
@@ -8169,6 +11602,406 @@ class LockedBrowser(QMainWindow):
         self._activity_current_tab_label = self._current_activity_tab_name()
         self._activity_started_monotonic = time.monotonic()
         self._record_attendance_touch(force=True, source="app_active")
+
+    def _handle_api_bridge_request(self, payload):
+        done = None
+        result_holder = None
+        if isinstance(payload, dict):
+            done = payload.get("done")
+            result_holder = payload.get("result")
+
+        def finish(ok=False, status=500, error="", response_payload=None):
+            if isinstance(result_holder, dict):
+                result_holder.clear()
+                result_holder.update({
+                    "ok": bool(ok),
+                    "status": safe_int(status, 500, 0),
+                    "error": str(error or "").strip(),
+                    "payload": dict(response_payload or {})
+                })
+            try:
+                if done is not None:
+                    done.set()
+            except Exception:
+                pass
+
+        try:
+            action = str((payload or {}).get("action") or "").strip().lower()
+            if action == "get_client_info":
+                finish(ok=True, status=200, response_payload=self.build_client_info_snapshot())
+                return
+
+            if action == "get_tab_stats":
+                finish(ok=True, status=200, response_payload=self.build_tab_stats_snapshot())
+                return
+
+            if action == "show_popup_message":
+                shown_payload = self.show_master_popup_message(
+                    title=(payload or {}).get("title"),
+                    message=(payload or {}).get("message"),
+                    level=(payload or {}).get("level"),
+                    source=(payload or {}).get("source"),
+                    duration_seconds=(payload or {}).get("duration_seconds")
+                )
+                finish(ok=True, status=200, response_payload=shown_payload)
+                return
+
+            finish(ok=False, status=400, error="Unsupported API bridge action")
+        except Exception as exc:
+            finish(ok=False, status=500, error=str(exc or "Unexpected API bridge error"))
+
+    def _tab_label_for_meta(self, meta):
+        if not isinstance(meta, dict):
+            return "Unknown"
+
+        if str(meta.get("name") or "") == "WhatsApp":
+            return self._format_whatsapp_label(meta.get("account_id"))
+
+        return str(meta.get("name") or "Unknown").strip() or "Unknown"
+
+    def probe_whatsapp_session_for_view(self, view):
+        meta = self.find_tab_meta_by_view(view)
+        if not meta or meta.get("name") != "WhatsApp":
+            return {}
+
+        script = r"""
+        (function() {
+            function collectStorageValues(storageObj) {
+                const out = [];
+                try {
+                    for (let i = 0; i < storageObj.length; i++) {
+                        const key = storageObj.key(i);
+                        const value = storageObj.getItem(key);
+                        out.push(String(key || ""));
+                        out.push(String(value || ""));
+                    }
+                } catch (e) {}
+                return out;
+            }
+
+            const candidates = [];
+            candidates.push(...collectStorageValues(window.localStorage));
+            candidates.push(...collectStorageValues(window.sessionStorage));
+
+            const exactKeys = [
+                "last-wid",
+                "last-wid-md",
+                "waLastLoggedInUser",
+                "lastLoggedInUser"
+            ];
+
+            for (const key of exactKeys) {
+                try {
+                    const value = localStorage.getItem(key);
+                    if (value) candidates.unshift(String(value));
+                } catch (e) {}
+                try {
+                    const value = sessionStorage.getItem(key);
+                    if (value) candidates.unshift(String(value));
+                } catch (e) {}
+            }
+
+            let wid = "";
+            const rx = /(\d{8,20})@(?:s\.whatsapp\.net|c\.us|lid)/i;
+            for (const item of candidates) {
+                const text = String(item || "");
+                const match = text.match(rx);
+                if (match && match[1]) {
+                    wid = match[1];
+                    break;
+                }
+            }
+
+            if (!wid) {
+                for (const item of candidates) {
+                    const digits = String(item || "").replace(/\D/g, "");
+                    if (digits.length >= 8 && digits.length <= 20) {
+                        wid = digits;
+                        break;
+                    }
+                }
+            }
+
+            const hasQr = !!document.querySelector('canvas[aria-label="Scan me!"], canvas[aria-label*="Scan"]');
+            const hasCompose = !!document.querySelector('footer div[contenteditable="true"], main footer div[contenteditable="true"]');
+            const hasMessages = !!document.querySelector(".message-in, .message-out");
+            const appReady = !!(
+                document.querySelector("#app") ||
+                document.querySelector("#pane-side") ||
+                document.querySelector("main header") ||
+                document.querySelector('[data-testid="chat-list-search"]')
+            );
+
+            return JSON.stringify({
+                wid: wid || "",
+                has_qr: hasQr,
+                has_compose: hasCompose,
+                has_messages: hasMessages,
+                app_ready: appReady
+            });
+        })();
+        """
+
+        loop = QEventLoop(self)
+        holder = {"result": ""}
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+
+        def finish():
+            if timer.isActive():
+                timer.stop()
+            loop.quit()
+
+        def handle_result(result):
+            holder["result"] = result or ""
+            finish()
+
+        timer.timeout.connect(finish)
+        timer.start(3000)
+        view.page().runJavaScript(script, handle_result)
+        loop.exec()
+
+        raw = holder.get("result") or ""
+        if not raw:
+            return {
+                "has_qr": False,
+                "has_compose": False,
+                "has_messages": False,
+                "app_ready": False,
+                "self_number": str(meta.get("wa_self_number") or "").strip(),
+                "self_display": str(meta.get("wa_self_display") or "").strip(),
+                "logged_in": bool(meta.get("wa_logged_in"))
+            }
+
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = {}
+
+        if not isinstance(data, dict):
+            data = {}
+
+        send_number, display_number = normalize_whatsapp_self_number(data.get("wid") or meta.get("wa_self_number") or "")
+        if send_number:
+            meta["wa_self_number"] = send_number
+            meta["wa_self_display"] = display_number or send_number
+
+        meta["wa_has_qr"] = bool(data.get("has_qr"))
+        meta["wa_logged_in"] = bool(
+            not meta.get("wa_has_qr")
+            and (
+                meta.get("wa_self_number")
+                or data.get("has_compose")
+                or data.get("has_messages")
+                or data.get("app_ready")
+            )
+        )
+
+        return {
+            "has_qr": bool(meta.get("wa_has_qr")),
+            "has_compose": bool(data.get("has_compose")),
+            "has_messages": bool(data.get("has_messages")),
+            "app_ready": bool(data.get("app_ready")),
+            "self_number": str(meta.get("wa_self_number") or "").strip(),
+            "self_display": str(meta.get("wa_self_display") or meta.get("wa_self_number") or "").strip(),
+            "logged_in": bool(meta.get("wa_logged_in"))
+        }
+
+    def build_client_info_snapshot(self):
+        current = self.tab_widget.currentWidget()
+        current_url = ""
+        if isinstance(current, QWebEngineView):
+            try:
+                current_url = current.url().toString()
+            except Exception:
+                current_url = ""
+
+        try:
+            username = getpass.getuser()
+        except Exception:
+            username = os.environ.get("USER") or os.environ.get("USERNAME") or ""
+
+        hostname = str(socket.gethostname() or "").strip()
+        node_name = str(platform.node() or "").strip()
+        mac_address = format_mac_address(uuid.getnode())
+
+        device_name = node_name or hostname or "Locked Browser Client"
+        if mac_address:
+            device_id = f"{device_name} [{mac_address}]"
+        else:
+            device_id = device_name
+
+        return {
+            "device_name": device_name,
+            "device_id": device_id,
+            "hostname": hostname or node_name or "",
+            "node_name": node_name or hostname or "",
+            "username": str(username or "").strip(),
+            "system": str(platform.system() or "").strip(),
+            "release": str(platform.release() or "").strip(),
+            "version": str(platform.version() or "").strip(),
+            "machine": str(platform.machine() or "").strip(),
+            "processor": str(platform.processor() or "").strip(),
+            "platform": str(platform.platform() or "").strip(),
+            "python_version": str(sys.version.split()[0] or "").strip(),
+            "qt_version": str(QT_VERSION_STR or "").strip(),
+            "mac_address": mac_address,
+            "local_ips": detect_local_private_ipv4_addresses(),
+            "timezone": USER_TIMEZONE_NAME,
+            "app_started_at": str(self._started_at_local_text or "").strip(),
+            "current_tab": self._current_activity_tab_name(),
+            "current_url": current_url,
+            "total_open_tabs": len(self.tab_views),
+        }
+
+    def build_tab_stats_snapshot(self):
+        today_value = today_key()
+        activity_data = load_activity_stats()
+        bucket = dict((activity_data.get("days") or {}).get(today_value) or {})
+        tab_seconds = dict(bucket.get("tab_seconds") or {})
+
+        current_view = self.tab_widget.currentWidget()
+        open_tabs = []
+        touched_tabs = []
+        untouched_tabs = []
+        whatsapp_tab_count = 0
+        logged_in_tabs = 0
+        total_seconds_today = 0
+
+        for meta in list(self.tab_views or []):
+            if not isinstance(meta, dict):
+                continue
+
+            label = self._tab_label_for_meta(meta)
+            seconds_today = safe_int(tab_seconds.get(label), 0, 0)
+            total_seconds_today += seconds_today
+            is_current = meta.get("view") == current_view
+
+            tab_url = ""
+            try:
+                tab_url = meta["view"].url().toString()
+            except Exception:
+                tab_url = ""
+
+            tab_info = {
+                "label": label,
+                "name": str(meta.get("name") or "").strip(),
+                "account_id": meta.get("account_id"),
+                "url": tab_url,
+                "is_current": bool(is_current),
+                "is_fixed": bool(meta.get("is_fixed")),
+                "seconds_today": seconds_today,
+                "touched_today": bool(seconds_today > 0),
+            }
+
+            if tab_info["touched_today"]:
+                touched_tabs.append(label)
+            else:
+                untouched_tabs.append(label)
+
+            if str(meta.get("name") or "") == "WhatsApp":
+                whatsapp_tab_count += 1
+                session_info = self.probe_whatsapp_session_for_view(meta.get("view"))
+                is_logged_in = bool(session_info.get("logged_in"))
+                if is_logged_in:
+                    logged_in_tabs += 1
+                tab_info.update({
+                    "logged_in": is_logged_in,
+                    "has_qr": bool(session_info.get("has_qr")),
+                    "self_number": str(session_info.get("self_number") or "").strip(),
+                    "self_display": str(session_info.get("self_display") or "").strip(),
+                    "session_state": (
+                        "logged_in"
+                        if is_logged_in else
+                        "qr"
+                        if session_info.get("has_qr") else
+                        "unknown"
+                    )
+                })
+
+            open_tabs.append(tab_info)
+
+        return {
+            "activity_window": "today",
+            "day": today_value,
+            "current_tab": self._current_activity_tab_name(),
+            "total_tabs": len(open_tabs),
+            "open_whatsapp_tabs": whatsapp_tab_count,
+            "logged_in_tabs": logged_in_tabs,
+            "logged_in_whatsapp_tabs": logged_in_tabs,
+            "logged_out_whatsapp_tabs": max(0, whatsapp_tab_count - logged_in_tabs),
+            "touched_tab_count": len(touched_tabs),
+            "untouched_tab_count": len(untouched_tabs),
+            "total_seconds_today": total_seconds_today,
+            "touched_tabs": touched_tabs,
+            "untouched_tabs": untouched_tabs,
+            "tabs": open_tabs,
+        }
+
+    def show_master_popup_message(self, title=None, message=None, level="info", source="Master Dashboard", duration_seconds=0):
+        popup_title = str(title or "Master Notice").strip() or "Master Notice"
+        popup_message = str(message or "").strip()
+        popup_level = str(level or "info").strip().lower()
+        popup_source = str(source or "Master Dashboard").strip() or "Master Dashboard"
+        popup_duration = safe_int(duration_seconds, 0, 0, 24 * 60 * 60)
+
+        if not popup_message:
+            raise ValueError("message is required")
+
+        icon_map = {
+            "info": QMessageBox.Icon.Information,
+            "notice": QMessageBox.Icon.Information,
+            "success": QMessageBox.Icon.Information,
+            "warning": QMessageBox.Icon.Warning,
+            "warn": QMessageBox.Icon.Warning,
+            "error": QMessageBox.Icon.Critical,
+            "critical": QMessageBox.Icon.Critical,
+        }
+
+        popup = QMessageBox(self)
+        popup.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        popup.setWindowTitle(popup_title)
+        popup.setIcon(icon_map.get(popup_level, QMessageBox.Icon.Information))
+        popup.setText(popup_message)
+        popup.setInformativeText(f"Source: {popup_source}")
+        popup.setStandardButtons(QMessageBox.StandardButton.Ok)
+        popup.setTextFormat(Qt.TextFormat.PlainText)
+        popup.setWindowModality(Qt.WindowModality.NonModal)
+        popup.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+
+        self._active_notice_popups.append(popup)
+
+        def cleanup_popup(*_args):
+            try:
+                if popup in self._active_notice_popups:
+                    self._active_notice_popups.remove(popup)
+            except Exception:
+                pass
+
+        popup.finished.connect(cleanup_popup)
+        popup.show()
+        popup.raise_()
+        popup.activateWindow()
+
+        if popup_duration > 0:
+            QTimer.singleShot(popup_duration * 1000, popup.close)
+
+        status_ms = popup_duration * 1000 if popup_duration > 0 else 6000
+        self.status_bar.showMessage(f"{popup_title}: {shorten_text(popup_message, 120)}", max(3000, min(20000, status_ms)))
+
+        try:
+            self.show_tray_message(popup_title, popup_message)
+        except Exception:
+            pass
+
+        return {
+            "title": popup_title,
+            "message": popup_message,
+            "level": popup_level,
+            "source": popup_source,
+            "duration_seconds": popup_duration,
+            "shown_at": format_system_local_timestamp(),
+        }
 
 
     def start_local_api_server(self):
@@ -8720,6 +12553,7 @@ class LockedBrowser(QMainWindow):
                 "chat_label": chat_label,
                 "conversation_key": conversation_key,
                 "to": self._format_whatsapp_label(account_id),
+                "account_label": self._format_whatsapp_label(account_id),
                 "content": content,
                 "message_length": message_length,
                 "has_attachment": bool(entry.get("has_attachment")),
@@ -8764,15 +12598,26 @@ class LockedBrowser(QMainWindow):
             const TEXT_PATTERNS = [
                 "download whatsapp for windows",
                 "download whatsapp for mac",
+                "get whatsapp for windows",
+                "get whatsapp for mac",
                 "download for windows",
-                "download for mac"
+                "download for mac",
+                "get for windows",
+                "get for mac",
+                "get from app store",
+                "download the mac app",
+                "download the windows app"
             ];
 
             const CANDIDATE_SELECTORS = [
                 'a[href*="whatsapp.com/download"]',
                 'button',
                 '[role="button"]',
-                'a'
+                'a',
+                'span',
+                '[aria-label]',
+                '[title]',
+                '[data-icon="wa-square-icon"]'
             ];
 
             function norm(value) {
@@ -8798,8 +12643,13 @@ class LockedBrowser(QMainWindow):
 
                 const text = getText(el);
                 const href = norm(el.getAttribute ? el.getAttribute("href") : "");
+                const iconName = norm(el.getAttribute ? el.getAttribute("data-icon") : "");
 
                 if (href.includes("whatsapp.com/download")) {
+                    return true;
+                }
+
+                if (iconName === "wa-square-icon") {
                     return true;
                 }
 
@@ -8812,8 +12662,8 @@ class LockedBrowser(QMainWindow):
                     return (
                         r.width > 0 &&
                         r.height > 0 &&
-                        r.width <= 520 &&
-                        r.height <= 160
+                        r.width <= 760 &&
+                        r.height <= 620
                     );
                 } catch (e) {
                     return false;
@@ -8831,14 +12681,43 @@ class LockedBrowser(QMainWindow):
                 el.style.setProperty("overflow", "hidden", "important");
             }
 
+            function findPromoContainer(el) {
+                let node = el;
+                for (let depth = 0; node && depth < 8; depth += 1) {
+                    if (!(node instanceof Element)) {
+                        node = node.parentElement;
+                        continue;
+                    }
+
+                    const text = getText(node);
+                    const href = norm(node.getAttribute ? node.getAttribute("href") : "");
+                    const iconName = norm(node.getAttribute ? node.getAttribute("data-icon") : "");
+                    const hasPromoText = TEXT_PATTERNS.some(p => text.includes(p));
+                    const hasDownloadLink =
+                        href.includes("whatsapp.com/download") ||
+                        !!node.querySelector('a[href*="whatsapp.com/download"]');
+                    const hasPromoIcon =
+                        iconName === "wa-square-icon" ||
+                        !!node.querySelector('[data-icon="wa-square-icon"]');
+
+                    if ((hasPromoText || hasDownloadLink || hasPromoIcon) && isSmallPromo(node)) {
+                        return node;
+                    }
+
+                    node = node.parentElement;
+                }
+                return el;
+            }
+
             function sweep() {
                 try {
                     for (const sel of CANDIDATE_SELECTORS) {
                         const nodes = document.querySelectorAll(sel);
                         nodes.forEach(el => {
                             if (!shouldHide(el)) return;
-                            if (!isSmallPromo(el)) return;
-                            hideElement(el);
+                            const target = findPromoContainer(el);
+                            if (!target || !isSmallPromo(target)) return;
+                            hideElement(target);
                         });
                     }
                 } catch (e) {
@@ -8886,6 +12765,438 @@ class LockedBrowser(QMainWindow):
 
         script = QWebEngineScript()
         script.setName("wa_download_banner_hider")
+        script.setSourceCode(script_source)
+        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        profile.scripts().insert(script)
+
+    def install_whatsapp_ui_cleanup(self, profile=None):
+        profile = profile or self.profile
+
+        script_source = r"""
+        (function() {
+            if (window.__waUiCleanupInstalled) return;
+            window.__waUiCleanupInstalled = true;
+
+            if (location.hostname !== "web.whatsapp.com") return;
+
+            const META_AI_ICON_FRAGMENT = "f-9DtrWWz5Y.webp";
+            const WATERMARK_ID = "ptn-managed-watermark";
+            const WATERMARK_TEXT = "Owned and Managed by PT Pendanaan Teknologi Nusa";
+            const CONTROL_LABELS_TO_HIDE = new Set(["menu", "settings"]);
+            const CONTROL_ICON_TOKENS_TO_HIDE = new Set(["ic-more-vert", "settings-refreshed"]);
+            const WORDMARK_SELECTORS = [
+                '[data-icon="wa-wordmark-refreshed"]',
+                '[data-icon="wa-wordmark"]'
+            ];
+
+            function norm(value) {
+                return String(value || "")
+                    .replace(/\u00A0/g, " ")
+                    .replace(/\s+/g, " ")
+                    .trim()
+                    .toLowerCase();
+            }
+
+            function escapeXml(value) {
+                return String(value || "")
+                    .replace(/&/g, "&amp;")
+                    .replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;")
+                    .replace(/"/g, "&quot;")
+                    .replace(/'/g, "&#39;");
+            }
+
+            function getText(el) {
+                if (!el) return "";
+                return norm(
+                    el.innerText ||
+                    el.textContent ||
+                    (el.getAttribute ? el.getAttribute("aria-label") : "") ||
+                    (el.getAttribute ? el.getAttribute("title") : "")
+                );
+            }
+
+            function parseRgb(value) {
+                const raw = String(value || "").trim();
+                if (!raw) return null;
+
+                let match = raw.match(/^rgba?\((\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+                if (match) {
+                    return {
+                        r: Math.max(0, Math.min(255, parseInt(match[1], 10) || 0)),
+                        g: Math.max(0, Math.min(255, parseInt(match[2], 10) || 0)),
+                        b: Math.max(0, Math.min(255, parseInt(match[3], 10) || 0))
+                    };
+                }
+
+                match = raw.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+                if (!match) return null;
+
+                let hex = match[1];
+                if (hex.length === 3) {
+                    hex = hex.split("").map(part => part + part).join("");
+                }
+
+                return {
+                    r: parseInt(hex.slice(0, 2), 16),
+                    g: parseInt(hex.slice(2, 4), 16),
+                    b: parseInt(hex.slice(4, 6), 16)
+                };
+            }
+
+            function colorLuminance(rgb) {
+                if (!rgb) return 1;
+
+                const channels = [rgb.r, rgb.g, rgb.b].map(v => {
+                    const scaled = v / 255;
+                    return scaled <= 0.03928
+                        ? scaled / 12.92
+                        : Math.pow((scaled + 0.055) / 1.055, 2.4);
+                });
+
+                return (0.2126 * channels[0]) + (0.7152 * channels[1]) + (0.0722 * channels[2]);
+            }
+
+            function computedBackgroundColor(el) {
+                if (!el || !(el instanceof Element)) return "";
+                try {
+                    const style = window.getComputedStyle(el);
+                    if (!style) return "";
+                    const bg = String(style.backgroundColor || "").trim();
+                    if (!bg || bg === "transparent" || bg === "rgba(0, 0, 0, 0)") return "";
+                    return bg;
+                } catch (e) {
+                    return "";
+                }
+            }
+
+            function isDarkTheme() {
+                const candidates = [
+                    document.querySelector("#app"),
+                    document.querySelector("[data-asset-chat-background-dark]"),
+                    document.querySelector("[role='application']"),
+                    document.body,
+                    document.documentElement
+                ];
+
+                for (const el of candidates) {
+                    const bg = computedBackgroundColor(el);
+                    if (!bg) continue;
+                    const rgb = parseRgb(bg);
+                    if (!rgb) continue;
+                    return colorLuminance(rgb) < 0.35;
+                }
+
+                return false;
+            }
+
+            function buildWatermarkDataUrl(darkTheme) {
+                const fill = darkTheme ? "255,255,255" : "22,56,96";
+                const fillOpacity = darkTheme ? "0.11" : "0.10";
+                const fontSize = "15";
+                const text = escapeXml(WATERMARK_TEXT);
+                const svg =
+                    '<svg xmlns="http://www.w3.org/2000/svg" width="440" height="260" viewBox="0 0 440 260">' +
+                    '<g transform="rotate(-24 220 130)">' +
+                    '<text x="18" y="148" font-family="Segoe UI, Arial, sans-serif" font-size="' + fontSize + '" font-weight="600" letter-spacing="0.5" fill="rgb(' + fill + ')" fill-opacity="' + fillOpacity + '">' + text + '</text>' +
+                    '</g>' +
+                    '</svg>';
+
+                return 'url("data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg) + '")';
+            }
+
+            function hideElement(el, markerAttr) {
+                if (!el || !(el instanceof Element)) return;
+                if (markerAttr && el.getAttribute(markerAttr) === "1") return;
+
+                if (markerAttr) {
+                    el.setAttribute(markerAttr, "1");
+                }
+
+                el.style.setProperty("display", "none", "important");
+                el.style.setProperty("visibility", "hidden", "important");
+                el.style.setProperty("pointer-events", "none", "important");
+                el.style.setProperty("max-height", "0", "important");
+                el.style.setProperty("overflow", "hidden", "important");
+            }
+
+            function rectLooksSmall(el) {
+                try {
+                    const r = el.getBoundingClientRect();
+                    return !!(
+                        r.width > 0 &&
+                        r.height > 0 &&
+                        r.width <= 420 &&
+                        r.height <= 120
+                    );
+                } catch (e) {
+                    return false;
+                }
+            }
+
+            function isInteractive(el) {
+                return !!(
+                    el &&
+                    el.matches &&
+                    el.matches('button, [role="button"], a, [data-navbar-item="true"]')
+                );
+            }
+
+            function findMetaAiTargetFromImage(img) {
+                let fallback = img.parentElement || img;
+                let node = img;
+
+                for (let depth = 0; node && depth < 9; depth += 1) {
+                    if (!(node instanceof Element)) {
+                        node = node.parentElement;
+                        continue;
+                    }
+
+                    const text = getText(node);
+                    const aria = norm(node.getAttribute ? node.getAttribute("aria-label") : "");
+                    const navbarItem = node.getAttribute && node.getAttribute("data-navbar-item") === "true";
+
+                    if (rectLooksSmall(node)) {
+                        fallback = node;
+                    }
+
+                    if (aria.includes("meta ai") || text.includes("meta ai")) {
+                        return node.closest('button, [role="button"], a, [data-navbar-item="true"]') || node;
+                    }
+
+                    if ((navbarItem || isInteractive(node)) && rectLooksSmall(node)) {
+                        return node;
+                    }
+
+                    node = node.parentElement;
+                }
+
+                return fallback;
+            }
+
+            function hideMetaAi() {
+                try {
+                    document.querySelectorAll(
+                        'button[aria-label="Meta AI"], [data-navbar-item="true"][aria-label="Meta AI"], [role="button"][aria-label="Meta AI"], a[aria-label="Meta AI"]'
+                    ).forEach(el => {
+                        const target = el.closest('button, [role="button"], a, [data-navbar-item="true"]') || el;
+                        hideElement(target, "data-ptn-hidden-meta-ai");
+                    });
+
+                    document.querySelectorAll('img[src*="' + META_AI_ICON_FRAGMENT + '"]').forEach(img => {
+                        const target = findMetaAiTargetFromImage(img);
+                        hideElement(target, "data-ptn-hidden-meta-ai");
+                    });
+                } catch (e) {
+                    console.log("waUiCleanup meta ai error:", e);
+                }
+            }
+
+            function findControlTarget(node) {
+                let fallback = null;
+                let current = node;
+
+                for (let depth = 0; current && depth < 9; depth += 1) {
+                    if (!(current instanceof Element)) {
+                        current = current.parentElement;
+                        continue;
+                    }
+
+                    const aria = norm(current.getAttribute ? current.getAttribute("aria-label") : "");
+                    const title = norm(current.getAttribute ? current.getAttribute("title") : "");
+                    const dataIcon = norm(current.getAttribute ? current.getAttribute("data-icon") : "");
+
+                    if (CONTROL_LABELS_TO_HIDE.has(aria) || CONTROL_LABELS_TO_HIDE.has(title) || CONTROL_ICON_TOKENS_TO_HIDE.has(dataIcon)) {
+                        return current.closest('button, [role="button"], a, [data-navbar-item="true"]') || current;
+                    }
+
+                    if (current.tagName === "TITLE" && CONTROL_ICON_TOKENS_TO_HIDE.has(norm(current.textContent))) {
+                        return current.closest('button, [role="button"], a, [data-navbar-item="true"]') || current.parentElement || current;
+                    }
+
+                    if (!fallback && isInteractive(current) && rectLooksSmall(current)) {
+                        fallback = current;
+                    }
+
+                    current = current.parentElement;
+                }
+
+                return fallback || (node instanceof Element ? node.closest('button, [role="button"], a, [data-navbar-item="true"]') : null) || node;
+            }
+
+            function hideSettingsAndMenuButtons() {
+                try {
+                    document.querySelectorAll(
+                        'button[aria-label], [role="button"][aria-label], [data-navbar-item="true"][aria-label], a[aria-label]'
+                    ).forEach(el => {
+                        const aria = norm(el.getAttribute("aria-label"));
+                        if (!CONTROL_LABELS_TO_HIDE.has(aria)) return;
+
+                        const target = el.closest('button, [role="button"], a, [data-navbar-item="true"]') || el;
+                        hideElement(target, "data-ptn-hidden-settings-menu");
+                    });
+
+                    document.querySelectorAll('[data-icon="settings-refreshed"], svg title').forEach(node => {
+                        let token = "";
+                        if (node.matches && node.matches("[data-icon]")) {
+                            token = norm(node.getAttribute("data-icon"));
+                        } else {
+                            token = norm(node.textContent);
+                        }
+
+                        if (!CONTROL_ICON_TOKENS_TO_HIDE.has(token)) return;
+
+                        const target = findControlTarget(node);
+                        hideElement(target, "data-ptn-hidden-settings-menu");
+                    });
+                } catch (e) {
+                    console.log("waUiCleanup settings/menu error:", e);
+                }
+            }
+
+            function ensureWordmarkLabel(parent) {
+                if (!parent || !(parent instanceof Element)) return;
+
+                let label = null;
+                for (const child of Array.from(parent.children || [])) {
+                    if (child && child.dataset && child.dataset.ptnDashboardWordmark === "1") {
+                        label = child;
+                        break;
+                    }
+                }
+
+                if (!label) {
+                    label = document.createElement("span");
+                    label.dataset.ptnDashboardWordmark = "1";
+                    label.style.setProperty("display", "inline-flex", "important");
+                    label.style.setProperty("align-items", "center", "important");
+                    label.style.setProperty("line-height", "28px", "important");
+                    label.style.setProperty("font-size", "18px", "important");
+                    label.style.setProperty("font-weight", "700", "important");
+                    label.style.setProperty("letter-spacing", "0.01em", "important");
+                    label.style.setProperty("white-space", "nowrap", "important");
+                    label.style.setProperty("color", "inherit", "important");
+                    label.style.setProperty("margin", "0", "important");
+                    label.style.setProperty("pointer-events", "none", "important");
+                    parent.appendChild(label);
+                }
+
+                label.textContent = "PTN Dashboard";
+            }
+
+            function replaceWordmark() {
+                try {
+                    for (const selector of WORDMARK_SELECTORS) {
+                        document.querySelectorAll(selector).forEach(icon => {
+                            const wrapper = icon.closest("span, div") || icon;
+                            const parent = wrapper.parentElement;
+                            if (!parent) return;
+
+                            hideElement(wrapper, "data-ptn-hidden-wordmark");
+                            ensureWordmarkLabel(parent);
+                        });
+                    }
+                } catch (e) {
+                    console.log("waUiCleanup wordmark error:", e);
+                }
+            }
+
+            function ensureWatermark() {
+                try {
+                    const host = document.body || document.documentElement;
+                    if (!host) return;
+
+                    let watermark = document.getElementById(WATERMARK_ID);
+                    if (!watermark) {
+                        watermark = document.createElement("div");
+                        watermark.id = WATERMARK_ID;
+                        watermark.setAttribute("aria-hidden", "true");
+                        watermark.textContent = "";
+                        watermark.style.setProperty("display", "block", "important");
+                        watermark.style.setProperty("position", "fixed", "important");
+                        watermark.style.setProperty("inset", "0", "important");
+                        watermark.style.setProperty("width", "100vw", "important");
+                        watermark.style.setProperty("height", "100vh", "important");
+                        watermark.style.setProperty("z-index", "2147483000", "important");
+                        watermark.style.setProperty("pointer-events", "none", "important");
+                        watermark.style.setProperty("user-select", "none", "important");
+                        watermark.style.setProperty("-webkit-user-select", "none", "important");
+                        watermark.style.setProperty("visibility", "visible", "important");
+                        watermark.style.setProperty("background-repeat", "repeat", "important");
+                        watermark.style.setProperty("background-position", "0 0", "important");
+                        watermark.style.setProperty("background-size", "440px 260px", "important");
+                        watermark.style.setProperty("overflow", "hidden", "important");
+                        watermark.style.setProperty("opacity", "1", "important");
+                        watermark.style.setProperty("padding", "0", "important");
+                        watermark.style.setProperty("margin", "0", "important");
+                        watermark.style.setProperty("background", "transparent", "important");
+                        watermark.style.setProperty("border", "0", "important");
+                        watermark.style.setProperty("box-shadow", "none", "important");
+                        watermark.style.setProperty("text-shadow", "none", "important");
+                        watermark.style.setProperty("transform", "translateZ(0)", "important");
+                        watermark.style.setProperty("mix-blend-mode", "normal", "important");
+                    }
+
+                    if (watermark.parentElement !== host) {
+                        host.appendChild(watermark);
+                    }
+
+                    const darkTheme = isDarkTheme();
+                    watermark.style.setProperty("background-image", buildWatermarkDataUrl(darkTheme), "important");
+                } catch (e) {
+                    console.log("waUiCleanup watermark error:", e);
+                }
+            }
+
+            function sweep() {
+                hideMetaAi();
+                hideSettingsAndMenuButtons();
+                replaceWordmark();
+                ensureWatermark();
+            }
+
+            let scheduled = false;
+            function scheduleSweep() {
+                if (scheduled) return;
+                scheduled = true;
+                setTimeout(() => {
+                    scheduled = false;
+                    sweep();
+                }, 250);
+            }
+
+            function start() {
+                sweep();
+
+                try {
+                    const observer = new MutationObserver(() => {
+                        scheduleSweep();
+                    });
+
+                    observer.observe(document.documentElement || document.body, {
+                        childList: true,
+                        subtree: true,
+                        attributes: true,
+                        attributeFilter: ["aria-label", "src", "data-icon", "data-navbar-item"]
+                    });
+                } catch (e) {}
+
+                setInterval(sweep, 4000);
+            }
+
+            if (document.readyState === "loading") {
+                document.addEventListener("DOMContentLoaded", function() {
+                    setTimeout(start, 900);
+                }, { once: true });
+            } else {
+                setTimeout(start, 900);
+            }
+        })();
+        """
+
+        script = QWebEngineScript()
+        script.setName("wa_ui_cleanup")
         script.setSourceCode(script_source)
         script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
         script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
@@ -9378,7 +13689,31 @@ class LockedBrowser(QMainWindow):
                 if (!row) return "";
 
                 const seen = new Set();
+                const preferredNodes = Array.from(row.querySelectorAll(
+                    'span[dir="auto"][title], div[dir="auto"][title]'
+                ));
+
+                preferredNodes.sort(function(a, b) {
+                    const aText = normalizeText(a.getAttribute("title") || a.textContent || "");
+                    const bText = normalizeText(b.getAttribute("title") || b.textContent || "");
+                    return aText.length - bText.length;
+                });
+
+                for (const el of preferredNodes) {
+                    const text = normalizeText(el.getAttribute("title") || el.textContent || "");
+                    const lower = text.toLowerCase();
+                    if (!text || isLikelySecondaryRowText(text)) continue;
+                    if (seen.has(lower)) continue;
+                    seen.add(lower);
+                    return text;
+                }
+
                 const nodes = Array.from(row.querySelectorAll('span[title], div[title]'));
+                nodes.sort(function(a, b) {
+                    const aText = normalizeText(a.getAttribute("title") || a.textContent || "");
+                    const bText = normalizeText(b.getAttribute("title") || b.textContent || "");
+                    return aText.length - bText.length;
+                });
 
                 for (const el of nodes) {
                     const text = normalizeText(el.getAttribute("title") || el.textContent || "");
@@ -9901,6 +14236,7 @@ class LockedBrowser(QMainWindow):
             payload = {
                 "timestamp": timestamp,
                 "from": self._format_whatsapp_label(account_id),
+                "account_label": self._format_whatsapp_label(account_id),
                 "to": to_phone or to_label,
                 "to_phone": to_phone or "",
                 "conversation_key": conversation_key,
@@ -9917,6 +14253,7 @@ class LockedBrowser(QMainWindow):
                 "sig": sig
             }
 
+            self._record_whatsapp_tab_interaction(account_id=account_id, source="manual_send")
             record_manual_send_activity(payload.get("to"))
             save_manual_send_log(payload)
             if sig:
@@ -9932,6 +14269,13 @@ class LockedBrowser(QMainWindow):
                 status=payload.get("status"),
                 display_number=payload.get("to"),
                 trigger=payload.get("trigger")
+            )
+
+            target_tab = self.find_whatsapp_tab_by_account_id(account_id) if account_id is not None else None
+            self.queue_qc_send_notification(
+                payload,
+                target_view=target_tab.get("view") if target_tab else None,
+                account_id=account_id
             )
 
             if bad_word_hits:
@@ -9979,14 +14323,7 @@ class LockedBrowser(QMainWindow):
             with open(NETWORK_LOG_FILE, "wb") as f:
                 f.write(encrypt_data([]))
 
-            with open(LAST_BLAST_FILE, "wb") as f:
-                f.write(encrypt_data({
-                    "recipients": [],
-                    "numbers": [],
-                    "message": "",
-                    "attachment_path": "",
-                    "updated_at": ""
-                }))
+            clear_last_blast_file()
 
             with open(MANUAL_SEND_LOG_FILE, "wb") as f:
                 f.write(encrypt_data([]))
@@ -10018,6 +14355,16 @@ class LockedBrowser(QMainWindow):
     def _queue_or_start_bulk_job(self, wa_tab, selected_items, template_text, attachment_path=""):
         if not wa_tab:
             QMessageBox.critical(self, "Error", "WhatsApp tab not found.")
+            return False
+
+        if self._has_qc_whatsapp_active_job():
+            active = self._qc_whatsapp_active or {}
+            label = self._format_whatsapp_label(active.get("account_id"))
+            QMessageBox.information(
+                self,
+                "Tab Borrowed",
+                f"{label} is currently borrowed by bot for QC WhatsApp forwarding.\n\nPlease wait until it finishes."
+            )
             return False
 
         if self._wa_sync_processing:
@@ -10097,6 +14444,7 @@ class LockedBrowser(QMainWindow):
 
         view = wa_tab["view"]
         account_id = wa_tab.get("account_id")
+        self._defer_qc_whatsapp_sender_for_account(account_id)
 
         if any(job["view"] == view for job in self._bulk_queue):
             QMessageBox.information(
@@ -10347,6 +14695,22 @@ class LockedBrowser(QMainWindow):
             pass
 
         try:
+            for batch_key in list(self._qc_email_batches.keys()):
+                self._flush_qc_email_batch(batch_key, force=True)
+        except Exception:
+            pass
+
+        try:
+            self._cleanup_qc_whatsapp_orphan_files(max_age_seconds=0)
+        except Exception:
+            pass
+
+        try:
+            self.run_storage_maintenance(quiet=True)
+        except Exception:
+            pass
+
+        try:
             if hasattr(self, "api_server"):
                 self.api_server.shutdown()
                 self.api_server.server_close()
@@ -10522,6 +14886,16 @@ class LockedBrowser(QMainWindow):
         return None
 
     def sync_whatsapp_histories(self):
+        if self._has_qc_whatsapp_active_job():
+            active = self._qc_whatsapp_active or {}
+            label = self._format_whatsapp_label(active.get("account_id"))
+            QMessageBox.information(
+                self,
+                "Tab Borrowed",
+                f"{label} is currently borrowed by bot for QC WhatsApp forwarding.\n\nPlease wait until it finishes."
+            )
+            return
+
         if self._bulk_processing:
             QMessageBox.information(
                 self,
@@ -10580,17 +14954,19 @@ class LockedBrowser(QMainWindow):
         self._wa_sync_total_duplicates = 0
         self._wa_sync_total_chats = 0
         self._wa_sync_log_cache = load_manual_send_log()
+        self._wa_sync_log_cache, repaired_changed = repair_whatsapp_history_log_entries(
+            self._wa_sync_log_cache,
+            bad_words=self.bad_words
+        )
+        if repaired_changed:
+            write_manual_send_log(self._wa_sync_log_cache)
         self._wa_sync_existing_signatures = set()
+        self._wa_sync_signature_index = {}
+        self._wa_sync_strict_match_index = {}
+        self._wa_sync_loose_match_index = {}
 
-        for item in self._wa_sync_log_cache:
-            if not isinstance(item, dict):
-                continue
-            raw_sig = str(item.get("sig") or "").strip()
-            if raw_sig:
-                self._wa_sync_existing_signatures.add(raw_sig)
-            derived_sig = derive_whatsapp_history_signature_from_log_item(item)
-            if derived_sig:
-                self._wa_sync_existing_signatures.add(derived_sig)
+        for index, item in enumerate(self._wa_sync_log_cache):
+            self._register_whatsapp_sync_log_entry(item, index)
 
         save_history({
             "timestamp": datetime.datetime.now(USER_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S"),
@@ -10615,6 +14991,7 @@ class LockedBrowser(QMainWindow):
             if self._wa_sync_target_account_id is not None else "-"
         )
         current_chat = str(self._wa_sync_current_state.get("currentChat") or "-").strip() or "-"
+        current_stage = str(self._wa_sync_current_state.get("stage") or "").strip() or "-"
         scanned_chats = int(self._wa_sync_current_state.get("scannedChats") or 0)
         total_known_chats = int(self._wa_sync_current_state.get("totalKnownChats") or 0)
         if total_known_chats < scanned_chats:
@@ -10672,6 +15049,7 @@ class LockedBrowser(QMainWindow):
             <div style="margin-bottom:8px;line-height:1.5;">
                 <div><b>Current tab:</b> {current_label}</div>
                 <div><b>Current chat:</b> {current_chat}</div>
+                <div><b>Current step:</b> {current_stage}</div>
                 <div><b>Chats done:</b> {scanned_chats} / {total_known_chats or '-'}</div>
                 <div><b>Saved histories:</b> {self._wa_sync_total_saved} &nbsp; <b>Duplicates skipped:</b> {self._wa_sync_total_duplicates}</div>
             </div>
@@ -10756,16 +15134,117 @@ class LockedBrowser(QMainWindow):
         except Exception:
             pass
 
+    def _wa_sync_add_index_entry(self, index_map, key, entry_index):
+        if not key:
+            return
+        bucket = index_map.setdefault(key, [])
+        if entry_index not in bucket:
+            bucket.append(entry_index)
+
+    def _register_whatsapp_sync_log_entry(self, entry, entry_index):
+        if not isinstance(entry, dict):
+            return
+
+        meta = derive_whatsapp_history_match_metadata(entry)
+        raw_sig = str(meta.get("raw_sig") or "").strip()
+        derived_sig = str(meta.get("derived_sig") or "").strip()
+        strict_key = str(meta.get("strict_key") or "").strip()
+        loose_key = str(meta.get("loose_key") or "").strip()
+
+        if raw_sig:
+            self._wa_sync_existing_signatures.add(raw_sig)
+            self._wa_sync_add_index_entry(self._wa_sync_signature_index, raw_sig, entry_index)
+        if derived_sig:
+            self._wa_sync_existing_signatures.add(derived_sig)
+            self._wa_sync_add_index_entry(self._wa_sync_signature_index, derived_sig, entry_index)
+        if strict_key:
+            self._wa_sync_add_index_entry(self._wa_sync_strict_match_index, strict_key, entry_index)
+        if loose_key:
+            self._wa_sync_add_index_entry(self._wa_sync_loose_match_index, loose_key, entry_index)
+
+    def _find_matching_whatsapp_sync_log_index(self, payload):
+        payload_meta = derive_whatsapp_history_match_metadata(payload)
+        if not payload_meta:
+            return None
+
+        candidate_indices = []
+        seen_indices = set()
+
+        def add_candidates(values, index_map):
+            for value in values:
+                key = str(value or "").strip()
+                if not key:
+                    continue
+                for idx in index_map.get(key, []):
+                    if idx in seen_indices:
+                        continue
+                    if idx < 0 or idx >= len(self._wa_sync_log_cache):
+                        continue
+                    candidate = self._wa_sync_log_cache[idx]
+                    if not isinstance(candidate, dict):
+                        continue
+                    seen_indices.add(idx)
+                    candidate_indices.append(idx)
+
+        add_candidates(
+            [payload_meta.get("raw_sig"), payload_meta.get("derived_sig")],
+            self._wa_sync_signature_index
+        )
+        add_candidates([payload_meta.get("strict_key")], self._wa_sync_strict_match_index)
+        add_candidates([payload_meta.get("loose_key")], self._wa_sync_loose_match_index)
+
+        if not candidate_indices:
+            return None
+
+        payload_account_key = str(payload_meta.get("self_account_key") or "").strip()
+        best_idx = None
+        best_score = None
+
+        for idx in candidate_indices:
+            existing_item = self._wa_sync_log_cache[idx]
+            existing_meta = derive_whatsapp_history_match_metadata(existing_item)
+            if not existing_meta:
+                continue
+
+            existing_account_key = str(existing_meta.get("self_account_key") or "").strip()
+            if (
+                payload_account_key
+                and existing_account_key
+                and payload_account_key != existing_account_key
+            ):
+                continue
+
+            score = 0
+            if payload_meta.get("raw_sig") and payload_meta.get("raw_sig") == existing_meta.get("raw_sig"):
+                score += 100
+            if payload_meta.get("derived_sig") and payload_meta.get("derived_sig") == existing_meta.get("derived_sig"):
+                score += 70
+            if payload_meta.get("strict_key") and payload_meta.get("strict_key") == existing_meta.get("strict_key"):
+                score += 60
+            if payload_meta.get("loose_key") and payload_meta.get("loose_key") == existing_meta.get("loose_key"):
+                score += 35
+            if payload_account_key and payload_account_key == existing_account_key:
+                score += 10
+
+            if score <= 0:
+                continue
+
+            if best_score is None or score > best_score or (score == best_score and idx < best_idx):
+                best_idx = idx
+                best_score = score
+
+        return best_idx
+
     def _persist_whatsapp_sync_batch(self, batch, account_id):
         if not isinstance(batch, list) or not batch:
             return
 
         account_label = self._format_whatsapp_label(account_id)
-        new_entries = []
         contact_updates = []
         saved_messages = 0
         duplicate_messages = 0
         saved_chats = 0
+        cache_changed = False
 
         for chat in batch:
             if not isinstance(chat, dict):
@@ -10812,18 +15291,6 @@ class LockedBrowser(QMainWindow):
                     author=author
                 )
 
-                if raw_sig and raw_sig in self._wa_sync_existing_signatures:
-                    duplicate_messages += 1
-                    continue
-                if derived_sig and derived_sig in self._wa_sync_existing_signatures:
-                    duplicate_messages += 1
-                    continue
-
-                if raw_sig:
-                    self._wa_sync_existing_signatures.add(raw_sig)
-                if derived_sig:
-                    self._wa_sync_existing_signatures.add(derived_sig)
-
                 _, bad_word_hits = mask_bad_words(content, self.bad_words)
                 bad_words = sorted(set(bad_word_hits))
 
@@ -10835,6 +15302,8 @@ class LockedBrowser(QMainWindow):
                         "from": from_phone or "",
                         "from_display": from_display,
                         "from_phone": from_phone,
+                        "to": account_label,
+                        "account_label": account_label,
                         "chat_label": chat_label,
                         "conversation_key": conversation_key,
                         "content": content,
@@ -10848,7 +15317,7 @@ class LockedBrowser(QMainWindow):
                         "message_author": author,
                         "sig": raw_sig or derived_sig
                     }
-                    contact_updates.append({
+                    contact_update = {
                         "send_number": from_phone or chat_label,
                         "timestamp_text": timestamp_value,
                         "direction": "incoming",
@@ -10860,12 +15329,13 @@ class LockedBrowser(QMainWindow):
                         "suggested_name": chat_label or from_display,
                         "trigger": "history_sync",
                         "auto_create": True
-                    })
+                    }
                 else:
                     to_value = chat_phone or chat_label or "Customer"
                     payload = {
                         "timestamp": timestamp_value,
                         "from": account_label,
+                        "account_label": account_label,
                         "to": to_value,
                         "to_phone": chat_phone or "",
                         "chat_label": chat_label,
@@ -10881,7 +15351,7 @@ class LockedBrowser(QMainWindow):
                         "message_author": author,
                         "sig": raw_sig or derived_sig
                     }
-                    contact_updates.append({
+                    contact_update = {
                         "send_number": chat_phone or chat_label,
                         "timestamp_text": timestamp_value,
                         "direction": "outgoing",
@@ -10893,17 +15363,41 @@ class LockedBrowser(QMainWindow):
                         "suggested_name": chat_label or to_value,
                         "trigger": "history_sync",
                         "auto_create": True
-                    })
+                    }
 
-                new_entries.append(payload)
+                payload, _ = normalize_whatsapp_history_entry(payload, bad_words=self.bad_words)
+                match_index = self._find_matching_whatsapp_sync_log_index(payload)
+
+                if match_index is not None:
+                    existing_item = self._wa_sync_log_cache[match_index]
+                    merged_item, item_changed = merge_whatsapp_history_entries(
+                        existing_item,
+                        payload,
+                        bad_words=self.bad_words
+                    )
+
+                    if item_changed:
+                        self._wa_sync_log_cache[match_index] = merged_item
+                        self._register_whatsapp_sync_log_entry(merged_item, match_index)
+                        contact_updates.append(contact_update)
+                        saved_messages += 1
+                        saved_any = True
+                        cache_changed = True
+                    else:
+                        duplicate_messages += 1
+                    continue
+
+                self._wa_sync_log_cache.append(payload)
+                self._register_whatsapp_sync_log_entry(payload, len(self._wa_sync_log_cache) - 1)
+                contact_updates.append(contact_update)
                 saved_messages += 1
                 saved_any = True
+                cache_changed = True
 
             if saved_any:
                 saved_chats += 1
 
-        if new_entries:
-            self._wa_sync_log_cache.extend(new_entries)
+        if cache_changed:
             write_manual_send_log(self._wa_sync_log_cache)
 
         if contact_updates:
@@ -10965,6 +15459,7 @@ class LockedBrowser(QMainWindow):
     def _finish_whatsapp_history_sync(self):
         self._wa_sync_processing = False
         self._wa_sync_poll_timer.stop()
+        self._set_qc_whatsapp_global_borrow_after(QC_WHATSAPP_BORROW_IDLE_SECONDS)
 
         completed_tabs = sum(1 for tab in self._wa_sync_tabs if tab.get("status") == "done")
         skipped_tabs = sum(1 for tab in self._wa_sync_tabs if tab.get("status") == "skipped")
@@ -11033,6 +15528,7 @@ class LockedBrowser(QMainWindow):
 
             self._wa_sync_target_view = meta["view"]
             self._wa_sync_target_account_id = meta.get("account_id")
+            self._defer_qc_whatsapp_sender_for_account(self._wa_sync_target_account_id)
             self._wa_sync_current_state = {}
             self._wa_sync_started_at = time.monotonic()
             tab_state["status"] = "running"
@@ -11137,6 +15633,7 @@ class LockedBrowser(QMainWindow):
                 startedAt: new Date().toISOString(),
                 finishedAt: "",
                 error: "",
+                stage: "preparing",
                 currentChat: "",
                 currentChatKey: "",
                 scannedChats: 0,
@@ -11303,6 +15800,19 @@ class LockedBrowser(QMainWindow):
                 };
             }
 
+            function isLikelyTimeOnlyText(text) {
+                const raw = normalizeMeridiem(normalizeText(text));
+                const lower = raw.toLowerCase();
+                if (!lower) return true;
+                if (/^\d{1,2}[:.]\d{2}(?::\d{2})?\s*(am|pm)?$/.test(lower)) {
+                    return true;
+                }
+                if (/^(today|yesterday|monday|tuesday|wednesday|thursday|friday|saturday|sunday)$/.test(lower)) {
+                    return true;
+                }
+                return false;
+            }
+
             function isQrOnlyMode() {
                 return !!document.querySelector(
                     'canvas[aria-label="Scan me!"], canvas[aria-label*="Scan"], div[data-ref] canvas'
@@ -11401,7 +15911,31 @@ class LockedBrowser(QMainWindow):
                 if (!row) return "";
 
                 const seen = new Set();
+                const preferredNodes = Array.from(row.querySelectorAll(
+                    'span[dir="auto"][title], div[dir="auto"][title]'
+                ));
+
+                preferredNodes.sort(function(a, b) {
+                    const aText = normalizeText(a.getAttribute("title") || a.textContent || "");
+                    const bText = normalizeText(b.getAttribute("title") || b.textContent || "");
+                    return aText.length - bText.length;
+                });
+
+                for (const el of preferredNodes) {
+                    const text = normalizeText(el.getAttribute("title") || el.textContent || "");
+                    const lower = text.toLowerCase();
+                    if (!text || isLikelySecondaryRowText(text)) continue;
+                    if (seen.has(lower)) continue;
+                    seen.add(lower);
+                    return text;
+                }
+
                 const nodes = Array.from(row.querySelectorAll('span[title], div[title]'));
+                nodes.sort(function(a, b) {
+                    const aText = normalizeText(a.getAttribute("title") || a.textContent || "");
+                    const bText = normalizeText(b.getAttribute("title") || b.textContent || "");
+                    return aText.length - bText.length;
+                });
 
                 for (const el of nodes) {
                     const text = normalizeText(el.getAttribute("title") || el.textContent || "");
@@ -11522,7 +16056,32 @@ class LockedBrowser(QMainWindow):
                     }
                 } catch (e) {}
 
+                try {
+                    let current = msgEl.parentElement;
+                    while (current && current !== document.body) {
+                        const value = current.getAttribute("data-pre-plain-text") || "";
+                        if (value) return value;
+                        current = current.parentElement;
+                    }
+                } catch (e) {}
+
                 return "";
+            }
+
+            function getMessageContainerEl(msgEl) {
+                let node = msgEl;
+                while (node && node !== document.body) {
+                    try {
+                        if ((node.getAttribute("data-id") || "").trim()) {
+                            return node;
+                        }
+                        if ((node.getAttribute("data-pre-plain-text") || "").trim()) {
+                            return node;
+                        }
+                    } catch (e) {}
+                    node = node.parentElement;
+                }
+                return msgEl;
             }
 
             function extractPhoneFromMessageElement(msgEl) {
@@ -11737,23 +16296,54 @@ class LockedBrowser(QMainWindow):
 
             function getMessageText(msgEl) {
                 const selectors = [
+                    '[data-testid="selectable-text"]',
                     '.selectable-text.copyable-text',
                     'span.selectable-text',
                     '.copyable-text'
                 ];
 
+                const candidates = [];
                 for (const sel of selectors) {
-                    const el = msgEl.querySelector(sel);
-                    if (!el) continue;
-                    const text = normalizeText(el.innerText || el.textContent || "");
-                    if (text) return text;
+                    const nodes = Array.from(msgEl.querySelectorAll(sel));
+                    for (const el of nodes) {
+                        if (!el) continue;
+                        if (el.closest('[aria-label="Quoted message"], .quoted-mention, ._aju3')) {
+                            continue;
+                        }
+                        const text = normalizeText(el.innerText || el.textContent || "");
+                        if (!text) continue;
+                        if (isLikelyTimeOnlyText(text)) continue;
+                        if (isLikelySecondaryRowText(text)) continue;
+                        if (isLikelySecondaryHeaderText(text)) continue;
+                        candidates.push(text);
+                    }
                 }
-                return normalizeText(msgEl.innerText || msgEl.textContent || "");
+
+                if (candidates.length) {
+                    candidates.sort(function(a, b) { return b.length - a.length; });
+                    return candidates[0];
+                }
+
+                const lines = String(msgEl.innerText || msgEl.textContent || "")
+                    .split(/\n+/)
+                    .map(normalizeText)
+                    .filter(Boolean)
+                    .filter(function(text) {
+                        return !isLikelyTimeOnlyText(text)
+                            && !isLikelySecondaryRowText(text)
+                            && !isLikelySecondaryHeaderText(text);
+                    });
+                if (lines.length) {
+                    lines.sort(function(a, b) { return b.length - a.length; });
+                    return lines[0];
+                }
+                return "";
             }
 
             function getMessageDomSignature(msgEl, chatKey, content) {
-                const dataId = msgEl.getAttribute("data-id") || "";
-                const prePlain = getMessagePrePlainText(msgEl);
+                const container = getMessageContainerEl(msgEl);
+                const dataId = (container && container.getAttribute("data-id")) || "";
+                const prePlain = getMessagePrePlainText(container || msgEl);
                 return [chatKey, dataId, prePlain, content].join("||");
             }
 
@@ -11852,8 +16442,10 @@ class LockedBrowser(QMainWindow):
                     }
                     content = normalizeText(content);
                     if (!content && !attachmentLabel) continue;
+                    if (content && isLikelyTimeOnlyText(content)) continue;
 
-                    const prePlain = getMessagePrePlainText(msgEl);
+                    const container = getMessageContainerEl(msgEl);
+                    const prePlain = getMessagePrePlainText(container || msgEl);
                     const meta = parsePrePlainMeta(prePlain);
                     const domSig = getMessageDomSignature(msgEl, identity.key || identity.label, content);
                     if (seen.has(domSig)) continue;
@@ -11879,6 +16471,10 @@ class LockedBrowser(QMainWindow):
             function getRowClickable(row) {
                 if (!row) return null;
                 const selectors = [
+                    'div[aria-selected][tabindex="-1"]',
+                    'div[aria-selected]',
+                    '[aria-selected="false"]',
+                    '[aria-selected="true"]',
                     'div[role="gridcell"][tabindex="0"]',
                     'div[role="gridcell"][tabindex="-1"]',
                     'div[role="gridcell"]',
@@ -11893,49 +16489,248 @@ class LockedBrowser(QMainWindow):
                 return row;
             }
 
-            function clickRow(row) {
-                const target = getRowClickable(row);
-                if (!target) return false;
-
-                try { target.focus && target.focus(); } catch (e) {}
-                try { target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })); } catch (e) {}
+            function isRowSelected(row) {
+                if (!row) return false;
                 try {
-                    target.click();
-                    return true;
+                    if (row.getAttribute("aria-selected") === "true") return true;
+                    return !!row.querySelector('[aria-selected="true"]');
+                } catch (e) {
+                    return false;
+                }
+            }
+
+            async function scrollRowIntoView(row) {
+                if (!row) return;
+                try {
+                    row.scrollIntoView({ block: "center", inline: "nearest" });
+                } catch (e) {
+                    try {
+                        row.scrollIntoView();
+                    } catch (e2) {}
+                }
+                await sleep(180);
+            }
+
+            function getRowVisualClickTarget(row) {
+                if (!row || !row.getBoundingClientRect) return null;
+                try {
+                    const rect = row.getBoundingClientRect();
+                    if (!rect || rect.width < 10 || rect.height < 10) return null;
+                    const x = Math.max(0, Math.round(rect.left + Math.min(rect.width * 0.35, rect.width - 8)));
+                    const y = Math.max(0, Math.round(rect.top + Math.min(rect.height * 0.5, rect.height - 8)));
+                    const el = document.elementFromPoint(x, y);
+                    if (el && (el === row || row.contains(el))) {
+                        return el;
+                    }
                 } catch (e) {}
-                try { target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true })); } catch (e) {}
+                return null;
+            }
+
+            function clickRow(row) {
+                const candidateTargets = [];
+                const primary = getRowClickable(row);
+                if (primary) candidateTargets.push(primary);
+                if (primary && primary.firstElementChild && !candidateTargets.includes(primary.firstElementChild)) {
+                    candidateTargets.push(primary.firstElementChild);
+                }
+                const visualTarget = getRowVisualClickTarget(row);
+                if (visualTarget && !candidateTargets.includes(visualTarget)) {
+                    candidateTargets.push(visualTarget);
+                }
+                if (row && !candidateTargets.includes(row)) candidateTargets.push(row);
+
+                for (const target of candidateTargets) {
+                    if (!target) continue;
+                    try { target.focus && target.focus(); } catch (e) {}
+                    try {
+                        const PointerCtor = window.PointerEvent || MouseEvent;
+                        target.dispatchEvent(new PointerCtor("pointerdown", { bubbles: true, cancelable: true, view: window }));
+                    } catch (e) {}
+                    try {
+                        const PointerCtor = window.PointerEvent || MouseEvent;
+                        target.dispatchEvent(new PointerCtor("pointerup", { bubbles: true, cancelable: true, view: window }));
+                    } catch (e) {}
+                    try { target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window })); } catch (e) {}
+                    try { target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window })); } catch (e) {}
+                    try { target.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window })); } catch (e) {}
+                    try { target.click(); } catch (e) {}
+                    try { target.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true })); } catch (e) {}
+                    try { target.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true })); } catch (e) {}
+                    try { target.dispatchEvent(new KeyboardEvent("keydown", { key: " ", code: "Space", bubbles: true })); } catch (e) {}
+                    try { target.dispatchEvent(new KeyboardEvent("keyup", { key: " ", code: "Space", bubbles: true })); } catch (e) {}
+                }
+
+                return candidateTargets.length > 0;
+            }
+
+            function hasConversationOpen() {
+                if (document.querySelector(".message-in, .message-out")) {
+                    return true;
+                }
+
+                const headerTitle = normalizeText(getHeaderChatTitle() || "");
+                if (headerTitle && !isLikelySecondaryHeaderText(headerTitle)) {
+                    return true;
+                }
+
+                return false;
+            }
+
+            function textLooksLikeSameChat(expectedText, actualText) {
+                const expected = normalizeText(expectedText || "").toLowerCase();
+                const actual = normalizeText(actualText || "").toLowerCase();
+                if (!expected || !actual) return false;
+                return expected === actual || actual.includes(expected) || expected.includes(actual);
+            }
+
+            async function openChatRow(row, expectedTitle) {
+                if (!row) return false;
+
+                for (let attempt = 0; attempt < 3; attempt++) {
+                    setState({ stage: "opening chat" });
+                    await scrollRowIntoView(row);
+                    if (!clickRow(row)) {
+                        await sleep(220);
+                        continue;
+                    }
+
+                    await sleep(320 + (attempt * 120));
+                    const headerTitle = normalizeText(getHeaderChatTitle() || "");
+                    const selectedTitle = normalizeText(getSelectedRowTitle() || "");
+
+                    if (headerTitle && textLooksLikeSameChat(expectedTitle, headerTitle)) {
+                        return true;
+                    }
+                    if (hasConversationOpen() && !expectedTitle) {
+                        return true;
+                    }
+                    if (
+                        isRowSelected(row)
+                        && selectedTitle
+                        && textLooksLikeSameChat(expectedTitle, selectedTitle)
+                        && headerTitle
+                        && !isLikelySecondaryHeaderText(headerTitle)
+                    ) {
+                        return true;
+                    }
+                }
+
                 return false;
             }
 
             async function waitForChatReady(candidate, timeoutMs) {
                 const startedAt = Date.now();
                 const timeout = timeoutMs || 7000;
+                let stableReadyCount = 0;
 
                 while ((Date.now() - startedAt) < timeout) {
+                    setState({ stage: "waiting for chat pane" });
                     const identity = getCurrentChatIdentity(null);
                     const headerTitle = normalizeText(identity.label || getHeaderChatTitle() || "");
                     const headerKey = normalizeText(identity.key || "");
                     const hasMessages = !!document.querySelector(".message-in, .message-out");
+                    const hasOpenHeader = !!(headerTitle && !isLikelySecondaryHeaderText(headerTitle));
+                    let matchesCandidate = false;
 
-                    if (hasMessages) {
-                        if (!candidate) return true;
-
-                        if (candidate.key && headerKey && candidate.key === headerKey) {
-                            return true;
+                    if (!candidate) {
+                        if (hasMessages || hasOpenHeader) {
+                            stableReadyCount += 1;
+                            if (stableReadyCount >= 2) return true;
+                        } else {
+                            stableReadyCount = 0;
                         }
+                        await sleep(180);
+                        continue;
+                    }
 
-                        if (candidate.title && headerTitle) {
-                            const expected = candidate.title.toLowerCase();
-                            const actual = headerTitle.toLowerCase();
-                            if (expected === actual || actual.includes(expected) || expected.includes(actual)) {
+                    if (candidate.key && headerKey && candidate.key === headerKey) {
+                        matchesCandidate = true;
+                    }
+
+                    if (!matchesCandidate && candidate.title && headerTitle) {
+                        if (textLooksLikeSameChat(candidate.title, headerTitle)) {
+                            matchesCandidate = true;
+                        }
+                    }
+
+                    if (hasMessages || hasOpenHeader) {
+                        if (matchesCandidate) {
+                            stableReadyCount += 1;
+                            if (stableReadyCount >= 2) {
                                 return true;
                             }
+                        } else {
+                            stableReadyCount = 0;
                         }
+                    } else {
+                        stableReadyCount = 0;
                     }
 
                     await sleep(250);
                 }
-                return !!document.querySelector(".message-in, .message-out");
+
+                return !!(
+                    document.querySelector(".message-in, .message-out")
+                    || (function() {
+                        const headerTitle = normalizeText(getHeaderChatTitle() || "");
+                        if (!candidate) {
+                            return !!(headerTitle && !isLikelySecondaryHeaderText(headerTitle));
+                        }
+                        if (candidate.key && headerKey && candidate.key === headerKey) {
+                            return true;
+                        }
+                        if (candidate.title && headerTitle && textLooksLikeSameChat(candidate.title, headerTitle)) {
+                            return true;
+                        }
+                        return false;
+                    })()
+                );
+            }
+
+            function buildMessagesFingerprint(messages) {
+                const list = Array.isArray(messages) ? messages : [];
+                if (!list.length) return "0";
+                const last = list[list.length - 1] || {};
+                const first = list[0] || {};
+                return [
+                    list.length,
+                    String(first.sig || ""),
+                    String(last.sig || ""),
+                    String(last.timestamp_iso || last.timestamp_display || last.timestamp_raw || ""),
+                    String(last.content || "")
+                ].join("||");
+            }
+
+            async function collectStableCurrentChatMessages(identity) {
+                let bestMessages = [];
+                let lastFingerprint = "";
+                let stableCount = 0;
+
+                for (let attempt = 0; attempt < 4; attempt++) {
+                    setState({ stage: "scrolling chat history" });
+                    await loadAllMessagesInCurrentChat();
+                    setState({ stage: "reading messages" });
+                    const messages = collectCurrentChatMessages(identity);
+                    const fingerprint = buildMessagesFingerprint(messages);
+
+                    if (messages.length > bestMessages.length) {
+                        bestMessages = messages;
+                    }
+
+                    if (fingerprint && fingerprint === lastFingerprint) {
+                        stableCount += 1;
+                        if (stableCount >= 1) {
+                            return bestMessages.length >= messages.length ? bestMessages : messages;
+                        }
+                    } else {
+                        stableCount = 0;
+                    }
+
+                    lastFingerprint = fingerprint;
+                    await sleep(260);
+                }
+
+                return bestMessages;
             }
 
             async function syncCurrentChat(row, rowTitle, visitedKeys) {
@@ -11947,46 +16742,75 @@ class LockedBrowser(QMainWindow):
 
                 setState({
                     currentChat: rowIdentity.label,
-                    currentChatKey: rowIdentity.key
+                    currentChatKey: rowIdentity.key,
+                    stage: "opening chat"
                 });
 
-                if (!clickRow(row)) {
-                    visitedKeys.add(rowIdentity.key);
-                    return;
+                let finalIdentity = null;
+                let finalMessages = [];
+
+                for (let attempt = 0; attempt < 3; attempt++) {
+                    const opened = await openChatRow(row, rowTitle);
+                    if (!opened) {
+                        await sleep(320);
+                        continue;
+                    }
+
+                    await sleep(650 + (attempt * 180));
+                    const ready = await waitForChatReady({ title: rowTitle, key: rowIdentity.key }, 8500);
+                    if (!ready) {
+                        await sleep(320);
+                        continue;
+                    }
+
+                    setState({ stage: "resolving contact identity" });
+                    const identity = await resolveCurrentChatIdentity(rowIdentity);
+                    const messages = await collectStableCurrentChatMessages(identity);
+
+                    finalIdentity = identity;
+                    finalMessages = messages;
+
+                    if (messages.length > 0) {
+                        break;
+                    }
+
+                    await sleep(320);
                 }
 
-                await sleep(800);
-                await waitForChatReady({ title: rowTitle, key: rowIdentity.key }, 8000);
-
-                const identity = await resolveCurrentChatIdentity(rowIdentity);
+                const identity = finalIdentity || rowIdentity;
                 const finalKey = identity.phone || identity.key || rowIdentity.key;
+
+                if (!finalMessages.length) {
+                    setState({ stage: "chat open failed" });
+                    return false;
+                }
+
                 visitedKeys.add(rowIdentity.key);
                 visitedKeys.add(finalKey);
 
                 setState({
                     currentChat: identity.label || rowIdentity.label,
                     currentChatKey: finalKey,
+                    stage: "saving chat result",
                     totalKnownChats: Math.max(
                         parseInt(window.__waHistorySyncState.totalKnownChats || 0, 10) || 0,
                         visitedKeys.size
                     )
                 });
 
-                await loadAllMessagesInCurrentChat();
-                const messages = collectCurrentChatMessages(identity);
-
                 window.__waHistorySyncBuffer.push({
                     conversation_key: finalKey,
                     chat_label: identity.label || rowIdentity.label,
                     chat_phone: identity.phone || "",
-                    message_count: messages.length,
-                    messages: messages
+                    message_count: finalMessages.length,
+                    messages: finalMessages
                 });
 
                 setState({
                     scannedChats: (parseInt(window.__waHistorySyncState.scannedChats || 0, 10) || 0) + 1,
-                    totalMessages: (parseInt(window.__waHistorySyncState.totalMessages || 0, 10) || 0) + messages.length
+                    totalMessages: (parseInt(window.__waHistorySyncState.totalMessages || 0, 10) || 0) + finalMessages.length
                 });
+                return true;
             }
 
             async function syncAllChats() {
@@ -12001,10 +16825,12 @@ class LockedBrowser(QMainWindow):
                 await sleep(450);
 
                 const visitedKeys = new Set();
+                const failedKeys = {};
                 let stableEndCount = 0;
 
                 for (let pass = 0; pass < 420; pass++) {
                     setState({
+                        stage: "scanning chat list",
                         totalKnownChats: Math.max(
                             parseInt(window.__waHistorySyncState.totalKnownChats || 0, 10) || 0,
                             visitedKeys.size
@@ -12023,7 +16849,15 @@ class LockedBrowser(QMainWindow):
                         if (visitedKeys.has(rowKey)) continue;
 
                         foundNewRow = true;
-                        await syncCurrentChat(row, title, visitedKeys);
+                        const synced = await syncCurrentChat(row, title, visitedKeys);
+                        if (!synced) {
+                            failedKeys[rowKey] = (parseInt(failedKeys[rowKey] || 0, 10) || 0) + 1;
+                            if (failedKeys[rowKey] >= 2) {
+                                visitedKeys.add(rowKey);
+                            }
+                        } else if (failedKeys[rowKey]) {
+                            delete failedKeys[rowKey];
+                        }
                         await sleep(200);
                     }
 
@@ -12137,6 +16971,7 @@ class LockedBrowser(QMainWindow):
             self.install_whatsapp_manual_send_logger(profile)
             self.install_whatsapp_incoming_reply_logger(profile)
             self.install_whatsapp_download_banner_hider(profile)
+            self.install_whatsapp_ui_cleanup(profile)
             self.install_whatsapp_cashier_mode_guard(profile)
             self.install_whatsapp_qr_only_mode(profile)
             self.install_whatsapp_contact_info_scraper(profile)
@@ -12159,8 +16994,12 @@ class LockedBrowser(QMainWindow):
     def create_performance_dock(self):
         self.performance_dock = PerformanceDock(self)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.performance_dock)
-        self.performance_dock.resize(680, 900)
-        self.performance_dock.show()
+        available = get_available_screen_geometry(self)
+        self.performance_dock.resize(
+            min(680, max(520, int(available.width() * 0.42))),
+            min(860, max(520, int(available.height() * 0.88)))
+        )
+        self.performance_dock.hide()
 
     def toggle_performance_dock(self):
         if not hasattr(self, "performance_dock"):
@@ -13191,6 +18030,22 @@ class LockedBrowser(QMainWindow):
         })
 
         if status == "sent":
+            self.queue_qc_send_notification(
+                {
+                    "timestamp": datetime.datetime.now(USER_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S"),
+                    "from": self._format_whatsapp_label(self._bulk_target_account_id),
+                    "to": str(display_number or actual_number),
+                    "content": actual_message,
+                    "send_type": "bulk_auto",
+                    "trigger": "bulk_blast",
+                    "status": "sent",
+                    "account_id": self._bulk_target_account_id
+                },
+                target_view=self._bulk_target_view,
+                account_id=self._bulk_target_account_id
+            )
+
+        if status == "sent":
             update_contact_interaction(
                 send_number=actual_number,
                 timestamp_text=datetime.datetime.now(USER_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S"),
@@ -13288,6 +18143,7 @@ class LockedBrowser(QMainWindow):
         if self._bulk_index >= len(self._bulk_recipients):
             finished_view = self._bulk_target_view
             finished_label = self._format_whatsapp_label(self._bulk_target_account_id)
+            finished_account_id = self._bulk_target_account_id
 
             self._bulk_processing = False
             self._bulk_poll_timer.stop()
@@ -13311,11 +18167,629 @@ class LockedBrowser(QMainWindow):
             started_next = self._start_next_queued_bulk_job()
 
             if not started_next:
+                self._set_qc_whatsapp_global_borrow_after(QC_WHATSAPP_BORROW_IDLE_SECONDS)
+                self._set_qc_whatsapp_borrow_after(
+                    finished_account_id,
+                    QC_WHATSAPP_BORROW_IDLE_SECONDS
+                )
                 QMessageBox.information(self, "Bulk Send", f"{finished_label}: all messages processed.")
 
             return
 
         self._load_next_bulk_whatsapp()
+
+    def inject_whatsapp_qc_auto_send(self, view, message):
+        escaped_message = json.dumps(message)
+        script = f"""
+        (function() {{
+            if (window.__waAutoSendState && window.__waAutoSendState.status === "running") {{
+                console.log("QC WhatsApp auto-sender already running on this page.");
+                return true;
+            }}
+
+            window.__ptnQcClipboardReady = false;
+            window.__ptnQcNativeSendReady = false;
+            window.__waAutoSendState = {{
+                status: "running",
+                startedAt: Date.now(),
+                error: null
+            }};
+
+            const TARGET_MESSAGE = {escaped_message};
+
+            const COMPOSE_SELECTORS = [
+                'footer div[contenteditable="true"][data-testid="conversation-compose-box-input"]',
+                'main footer div[contenteditable="true"][data-testid="conversation-compose-box-input"]',
+                'footer div[contenteditable="true"][role="textbox"]',
+                'main footer div[contenteditable="true"][role="textbox"]',
+                'footer div[contenteditable="true"]',
+                'main footer div[contenteditable="true"]'
+            ];
+
+            const GO_TO_CHAT_SELECTORS = [
+                'div[role="button"][aria-label*="chat"]',
+                'a[href*="whatsapp.com"]',
+                'div[aria-label*="Go to chat"]'
+            ];
+
+            const SEND_BUTTON_SELECTORS = [
+                'div[role="dialog"] button[aria-label="Send"]',
+                'div[role="dialog"] button[aria-label*="Send"]',
+                'div[role="dialog"] button[aria-label*="Kirim"]',
+                'div[role="dialog"] button[data-testid="compose-btn-send"]',
+                'div[role="dialog"] span[data-icon="send"]',
+                'div[role="dialog"] span[data-icon="wds-ic-send-filled"]',
+                'footer button[aria-label="Send"]',
+                'footer button[aria-label*="Send"]',
+                'footer button[aria-label*="Kirim"]',
+                'footer button[data-testid="compose-btn-send"]',
+                'footer span[data-icon="send"]',
+                'footer span[data-icon="wds-ic-send-filled"]',
+                'button[aria-label="Send"]',
+                'button[aria-label*="Send"]',
+                'button[aria-label*="Kirim"]',
+                'button[data-testid="compose-btn-send"]',
+                'span[data-icon="send"]',
+                'span[data-icon="wds-ic-send-filled"]'
+            ];
+
+            const MEDIA_CAPTION_SELECTORS = [
+                'div[contenteditable="true"][data-testid="media-caption-input"]',
+                'div[contenteditable="true"][aria-label*="caption"]',
+                'div[contenteditable="true"][title*="caption"]',
+                'div[contenteditable="true"][data-lexical-editor="true"][role="textbox"]'
+            ];
+
+            const ATTACHMENT_PREVIEW_SELECTORS = [
+                'div[role="dialog"] img[src^="blob:"]',
+                'div[role="dialog"] video[src^="blob:"]',
+                'div[role="dialog"] canvas',
+                'footer img[src^="blob:"]',
+                'footer video[src^="blob:"]',
+                'footer canvas'
+            ];
+
+            const QR_SELECTOR = 'canvas[aria-label="Scan me!"]';
+
+            const INVALID_PATTERNS = [
+                'phone number shared via url is invalid',
+                'the phone number shared via url is invalid',
+                'phone number shared via url is invalid.',
+                'this phone number isn\\'t on whatsapp',
+                'this phone number is not on whatsapp',
+                'this number isn\\'t on whatsapp',
+                'this number is not on whatsapp',
+                'number shared via url is invalid',
+                'nomor telepon yang dibagikan melalui url tidak valid',
+                'nomor ini tidak terdaftar di whatsapp',
+                'nomor telepon ini tidak terdaftar di whatsapp'
+            ];
+
+            function normalizeText(s) {{
+                return String(s || "")
+                    .replace(/\\u00A0/g, " ")
+                    .replace(/\\s+/g, " ")
+                    .trim()
+                    .toLowerCase();
+            }}
+
+            function getPageText() {{
+                try {{
+                    return normalizeText(document.body ? document.body.innerText : "");
+                }} catch (e) {{
+                    return "";
+                }}
+            }}
+
+            function detectInvalidRecipient() {{
+                const bodyText = getPageText();
+                for (const pattern of INVALID_PATTERNS) {{
+                    if (bodyText.includes(pattern)) {{
+                        return pattern;
+                    }}
+                }}
+
+                const candidates = Array.from(document.querySelectorAll(
+                    'div[role="dialog"], div[data-animate-modal-popup="true"], main, body'
+                ));
+
+                for (const el of candidates) {{
+                    const txt = normalizeText(el.innerText || el.textContent || "");
+                    for (const pattern of INVALID_PATTERNS) {{
+                        if (txt.includes(pattern)) {{
+                            return pattern;
+                        }}
+                    }}
+                }}
+
+                return "";
+            }}
+
+            function dismissInvalidDialogIfAny() {{
+                const labels = ['ok', 'close', 'tutup', 'cancel'];
+                const nodes = Array.from(document.querySelectorAll('button, div[role="button"], span[role="button"]'));
+
+                for (const node of nodes) {{
+                    const txt = normalizeText(node.innerText || node.textContent || node.getAttribute('aria-label') || '');
+                    if (labels.includes(txt)) {{
+                        try {{
+                            node.click();
+                            return true;
+                        }} catch (e) {{}}
+                    }}
+                }}
+                return false;
+            }}
+
+            function clickElement(element) {{
+                if (!element) return false;
+                try {{
+                    element.focus?.();
+                    element.click();
+                    return true;
+                }} catch (e) {{
+                    console.log('QC click error:', e);
+                    return false;
+                }}
+            }}
+
+            function hardClickElement(element) {{
+                if (!element) return false;
+                try {{
+                    element.focus?.();
+                }} catch (e) {{}}
+
+                try {{
+                    element.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true, cancelable: true, view: window }}));
+                }} catch (e) {{}}
+                try {{
+                    element.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true, cancelable: true, view: window }}));
+                }} catch (e) {{}}
+                try {{
+                    element.dispatchEvent(new MouseEvent('click', {{ bubbles: true, cancelable: true, view: window }}));
+                }} catch (e) {{}}
+
+                try {{
+                    element.click();
+                    return true;
+                }} catch (e) {{
+                    return false;
+                }}
+            }}
+
+            function isElementVisible(element) {{
+                if (!element) return false;
+                const rect = element.getBoundingClientRect();
+                return rect.width >= 8 && rect.height >= 8;
+            }}
+
+            function getVisiblePreviewDialog() {{
+                const dialogs = Array.from(document.querySelectorAll('div[role="dialog"], div[data-animate-modal-popup="true"]'));
+                for (const dialog of dialogs) {{
+                    if (!isElementVisible(dialog)) continue;
+                    const txt = normalizeText(dialog.innerText || dialog.textContent || '');
+                    if (dialog.querySelector('img[src^="blob:"], video[src^="blob:"], canvas') || txt.includes('caption') || txt.includes('add a caption') || txt.includes('tambahkan keterangan')) {{
+                        return dialog;
+                    }}
+                }}
+                return null;
+            }}
+
+            function isSendButtonUsable(button) {{
+                if (!button || !isElementVisible(button)) return false;
+                const disabledAttr = String(button.getAttribute('disabled') || '').toLowerCase();
+                const ariaDisabled = String(button.getAttribute('aria-disabled') || '').toLowerCase();
+                return disabledAttr !== 'true' && ariaDisabled !== 'true';
+            }}
+
+            function findComposeBox() {{
+                for (const sel of COMPOSE_SELECTORS) {{
+                    const candidates = Array.from(document.querySelectorAll(sel));
+                    for (const el of candidates) {{
+                        if (!el) continue;
+                        const footer = el.closest('footer');
+                        if (!footer) continue;
+
+                        const meta = (
+                            (el.getAttribute('aria-label') || '') + ' ' +
+                            (el.getAttribute('aria-placeholder') || '') + ' ' +
+                            (el.getAttribute('data-testid') || '')
+                        ).toLowerCase();
+
+                        if (meta.includes('search')) continue;
+
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width < 80 || rect.height < 20) continue;
+
+                        return el;
+                    }}
+                }}
+                return null;
+            }}
+
+            function findMediaCaptionBox() {{
+                for (const sel of MEDIA_CAPTION_SELECTORS) {{
+                    const nodes = Array.from(document.querySelectorAll(sel));
+                    for (const node of nodes) {{
+                        if (!isElementVisible(node)) continue;
+                        return node;
+                    }}
+                }}
+                return null;
+            }}
+
+            function findSendButton(options = {{}}) {{
+                const preferDialog = !!options.preferDialog;
+                const found = [];
+                const roots = [];
+                const visibleDialog = getVisiblePreviewDialog();
+                if (preferDialog && visibleDialog) roots.push(visibleDialog);
+                roots.push(document);
+
+                const addCandidate = (btn) => {{
+                    if (!btn) return;
+
+                    let target = btn;
+                    if (btn.tagName === 'SPAN' && btn.hasAttribute('data-icon')) {{
+                        let parent = btn.parentElement;
+                        while (parent && parent.tagName !== 'BUTTON') parent = parent.parentElement;
+                        if (parent) target = parent;
+                    }}
+
+                    if (!target || found.includes(target)) return;
+                    if (!isSendButtonUsable(target)) return;
+                    found.push(target);
+                }};
+
+                for (const root of roots) {{
+                    if (!root) continue;
+                    const rootIsDialog = root !== document;
+                    for (const sel of SEND_BUTTON_SELECTORS) {{
+                        const nodes = Array.from(root.querySelectorAll(sel));
+                        for (const btn of nodes) {{
+                            addCandidate(btn);
+                        }}
+                    }}
+                    if (found.length && rootIsDialog) break;
+                }}
+
+                if (!found.length) return null;
+                found.sort((a, b) => {{
+                    const ra = a.getBoundingClientRect();
+                    const rb = b.getBoundingClientRect();
+                    return (rb.bottom + rb.right) - (ra.bottom + ra.right);
+                }});
+                return found[0];
+            }}
+
+            function hasAttachmentPreview() {{
+                for (const sel of ATTACHMENT_PREVIEW_SELECTORS) {{
+                    const nodes = Array.from(document.querySelectorAll(sel));
+                    for (const node of nodes) {{
+                        if (isElementVisible(node)) return true;
+                    }}
+                }}
+                return false;
+            }}
+
+            function waitForAnySelector(selectors, timeout = 6000, parent = document) {{
+                return new Promise((resolve, reject) => {{
+                    const check = () => {{
+                        for (const sel of selectors) {{
+                            const el = parent.querySelector(sel);
+                            if (el) return el;
+                        }}
+                        return null;
+                    }};
+
+                    const existing = check();
+                    if (existing) return resolve(existing);
+
+                    const observer = new MutationObserver(() => {{
+                        const found = check();
+                        if (found) {{
+                            observer.disconnect();
+                            resolve(found);
+                        }}
+                    }});
+
+                    observer.observe(parent, {{ childList: true, subtree: true }});
+
+                    setTimeout(() => {{
+                        observer.disconnect();
+                        reject(new Error('Timeout waiting for selector'));
+                    }}, timeout);
+                }});
+            }}
+
+            async function waitForComposeBox(timeoutMs) {{
+                const startedAt = Date.now();
+                while ((Date.now() - startedAt) < timeoutMs) {{
+                    const composeBox = findComposeBox();
+                    if (composeBox) return composeBox;
+                    await new Promise(r => setTimeout(r, 250));
+                }}
+                return null;
+            }}
+
+            async function waitForMediaCaptionBox(timeoutMs) {{
+                const startedAt = Date.now();
+                while ((Date.now() - startedAt) < timeoutMs) {{
+                    const captionBox = findMediaCaptionBox();
+                    if (captionBox) return captionBox;
+                    await new Promise(r => setTimeout(r, 250));
+                }}
+                return null;
+            }}
+
+            async function waitForSendButton(timeoutMs, preferDialog) {{
+                const startedAt = Date.now();
+                while ((Date.now() - startedAt) < timeoutMs) {{
+                    const button = findSendButton({{ preferDialog: !!preferDialog }});
+                    if (button) return button;
+                    await new Promise(r => setTimeout(r, 200));
+                }}
+                return null;
+            }}
+
+            async function waitForPreviewOrCaption(timeoutMs) {{
+                const startedAt = Date.now();
+                while ((Date.now() - startedAt) < timeoutMs) {{
+                    const captionBox = findMediaCaptionBox();
+                    if (captionBox) return {{ hasPreview: true, captionBox: captionBox }};
+                    if (hasAttachmentPreview()) return {{ hasPreview: true, captionBox: null }};
+                    await new Promise(r => setTimeout(r, 250));
+                }}
+                return {{ hasPreview: false, captionBox: null }};
+            }}
+
+            function insertMessagePreserveLines(composeBox, text) {{
+                const normalized = String(text || "").replace(/\\r\\n/g, "\\n");
+                composeBox.focus();
+
+                const selection = window.getSelection();
+                const range = document.createRange();
+                range.selectNodeContents(composeBox);
+                range.deleteContents();
+                range.collapse(true);
+
+                selection.removeAllRanges();
+                selection.addRange(range);
+
+                const lines = normalized.split("\\n");
+                lines.forEach((line, idx) => {{
+                    if (idx > 0) {{
+                        const br = document.createElement("br");
+                        range.insertNode(br);
+                        range.setStartAfter(br);
+                        range.collapse(true);
+                    }}
+
+                    if (line.length > 0) {{
+                        const textNode = document.createTextNode(line);
+                        range.insertNode(textNode);
+                        range.setStartAfter(textNode);
+                        range.collapse(true);
+                    }}
+                }});
+
+                selection.removeAllRanges();
+                selection.addRange(range);
+
+                composeBox.dispatchEvent(new InputEvent('input', {{
+                    bubbles: true,
+                    data: normalized,
+                    inputType: 'insertText'
+                }}));
+                composeBox.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            }}
+
+            function fireEnter(target) {{
+                if (!target) return false;
+                try {{
+                    target.focus?.();
+                }} catch (e) {{}}
+
+                try {{
+                    const down = new KeyboardEvent('keydown', {{ key: 'Enter', code: 'Enter', which: 13, keyCode: 13, bubbles: true, cancelable: true }});
+                    const press = new KeyboardEvent('keypress', {{ key: 'Enter', code: 'Enter', which: 13, keyCode: 13, bubbles: true, cancelable: true }});
+                    const up = new KeyboardEvent('keyup', {{ key: 'Enter', code: 'Enter', which: 13, keyCode: 13, bubbles: true, cancelable: true }});
+                    target.dispatchEvent(down);
+                    target.dispatchEvent(press);
+                    target.dispatchEvent(up);
+                    return true;
+                }} catch (e) {{
+                    return false;
+                }}
+            }}
+
+            async function trySendAttachmentPreview(captionBox) {{
+                const sendButton = await waitForSendButton(5000, true);
+                if (!sendButton) {{
+                    return false;
+                }}
+
+                for (let attempt = 0; attempt < 3; attempt++) {{
+                    hardClickElement(sendButton);
+                    await new Promise(r => setTimeout(r, 900));
+                    if (!hasAttachmentPreview()) return true;
+
+                    if (captionBox) {{
+                        fireEnter(captionBox);
+                        await new Promise(r => setTimeout(r, 900));
+                        if (!hasAttachmentPreview()) return true;
+                    }}
+                }}
+
+                const dialog = getVisiblePreviewDialog();
+                if (dialog) {{
+                    fireEnter(dialog);
+                    await new Promise(r => setTimeout(r, 900));
+                }}
+
+                return !hasAttachmentPreview();
+            }}
+
+            async function sendTextAfterAttachment(messageText) {{
+                if (!messageText) return {{ ok: true, error: null }};
+
+                const composeBox = await waitForComposeBox(10000);
+                if (!composeBox) {{
+                    return {{ ok: false, error: 'compose_box_timeout_after_attachment' }};
+                }}
+
+                insertMessagePreserveLines(composeBox, messageText);
+                await new Promise(r => setTimeout(r, 1200));
+
+                const sendButton = findSendButton();
+                if (!sendButton) {{
+                    return {{ ok: false, error: 'send_button_not_found' }};
+                }}
+
+                clickElement(sendButton);
+
+                for (let i = 0; i < 10; i++) {{
+                    await new Promise(r => setTimeout(r, 400));
+                    const liveComposeBox = findComposeBox();
+                    const remaining = liveComposeBox
+                        ? ((liveComposeBox.innerText || liveComposeBox.textContent || '').replace(/\\u00A0/g, ' ')).trim()
+                        : "";
+                    if (!remaining) {{
+                        return {{ ok: true, error: null }};
+                    }}
+                }}
+
+                return {{ ok: false, error: 'message_not_cleared_after_send' }};
+            }}
+
+            async function attemptSend() {{
+                try {{
+                    await waitForAnySelector([QR_SELECTOR], 5000);
+                    return {{ ok: false, error: 'not_logged_in_qr' }};
+                }} catch (e) {{}}
+
+                try {{
+                    const goToChat = await waitForAnySelector(GO_TO_CHAT_SELECTORS, 4000);
+                    if (goToChat) {{
+                        clickElement(goToChat);
+                        await new Promise(r => setTimeout(r, 800));
+                    }}
+                }} catch (e) {{}}
+
+                try {{
+                    const allButtons = document.querySelectorAll('div[role="button"], button');
+                    for (let btn of allButtons) {{
+                        const txt = (btn.textContent || '').toLowerCase();
+                        if (txt.includes('go to chat') || txt.includes('continue to chat')) {{
+                            clickElement(btn);
+                            await new Promise(r => setTimeout(r, 1000));
+                            break;
+                        }}
+                    }}
+                }} catch (e) {{}}
+
+                let composeBox = null;
+                const waitStart = Date.now();
+                while ((Date.now() - waitStart) < 15000) {{
+                    const invalidReason = detectInvalidRecipient();
+                    if (invalidReason) {{
+                        dismissInvalidDialogIfAny();
+                        return {{ ok: false, error: 'not_on_whatsapp' }};
+                    }}
+
+                    composeBox = findComposeBox();
+                    if (composeBox) break;
+                    await new Promise(r => setTimeout(r, 250));
+                }}
+
+                if (!composeBox) {{
+                    const invalidReason = detectInvalidRecipient();
+                    if (invalidReason) {{
+                        dismissInvalidDialogIfAny();
+                        return {{ ok: false, error: 'not_on_whatsapp' }};
+                    }}
+                    return {{ ok: false, error: 'compose_box_timeout' }};
+                }}
+
+                try {{
+                    composeBox.focus();
+                }} catch (e) {{}}
+
+                window.__ptnQcClipboardReady = true;
+
+                const previewResult = await waitForPreviewOrCaption(15000);
+                if (!previewResult.hasPreview) {{
+                    return {{ ok: false, error: 'clipboard_paste_not_detected' }};
+                }}
+
+                let usedCaption = false;
+                let activeCaptionBox = previewResult.captionBox || null;
+                if (TARGET_MESSAGE) {{
+                    const captionBox = activeCaptionBox || await waitForMediaCaptionBox(5000);
+                    if (captionBox) {{
+                        insertMessagePreserveLines(captionBox, TARGET_MESSAGE);
+                        await new Promise(r => setTimeout(r, 900));
+                        usedCaption = true;
+                        activeCaptionBox = captionBox;
+                    }}
+                }}
+
+                window.__ptnQcNativeSendReady = true;
+                const sentAttachment = await trySendAttachmentPreview(activeCaptionBox);
+                window.__ptnQcNativeSendReady = false;
+                if (!sentAttachment) {{
+                    return {{ ok: false, error: 'attachment_send_button_not_found' }};
+                }}
+
+                for (let i = 0; i < 14; i++) {{
+                    await new Promise(r => setTimeout(r, 500));
+
+                    const invalidReason = detectInvalidRecipient();
+                    if (invalidReason) {{
+                        dismissInvalidDialogIfAny();
+                        return {{ ok: false, error: 'not_on_whatsapp' }};
+                    }}
+
+                    if (!hasAttachmentPreview()) {{
+                        if (!TARGET_MESSAGE || usedCaption) {{
+                            return {{ ok: true, error: null }};
+                        }}
+                        return await sendTextAfterAttachment(TARGET_MESSAGE);
+                    }}
+                }}
+
+                if (!TARGET_MESSAGE || usedCaption) {{
+                    return {{ ok: false, error: 'attachment_not_cleared_after_send' }};
+                }}
+
+                return await sendTextAfterAttachment(TARGET_MESSAGE);
+            }}
+
+            setTimeout(async () => {{
+                try {{
+                    const result = await attemptSend();
+                    window.__waAutoSendState = {{
+                        status: result.ok ? "sent" : "failed",
+                        finishedAt: Date.now(),
+                        error: result.error || null
+                    }};
+                }} catch (err) {{
+                    console.log("QC WhatsApp auto-send fatal:", err);
+                    window.__waAutoSendState = {{
+                        status: "failed",
+                        finishedAt: Date.now(),
+                        error: err && err.message ? err.message : "unknown"
+                    }};
+                }} finally {{
+                    window.__ptnQcClipboardReady = false;
+                    window.__ptnQcNativeSendReady = false;
+                }}
+            }}, 350);
+
+            return true;
+        }})();
+        """
+        view.page().runJavaScript(script)
 
     def inject_whatsapp_auto_send(self, view, message, attachment_path=""):
         attachment_path = normalize_template_attachment_path(attachment_path)
@@ -13379,6 +18853,22 @@ class LockedBrowser(QMainWindow):
                 'div[role="button"][title*="Attach"]',
                 'span[data-icon="plus-rounded"]',
                 'span[data-icon="clip"]'
+            ];
+
+            const MEDIA_CAPTION_SELECTORS = [
+                'div[contenteditable="true"][data-testid="media-caption-input"]',
+                'div[contenteditable="true"][aria-label*="caption"]',
+                'div[contenteditable="true"][title*="caption"]',
+                'div[contenteditable="true"][data-lexical-editor="true"][role="textbox"]'
+            ];
+
+            const ATTACHMENT_PREVIEW_SELECTORS = [
+                'div[role="dialog"] img[src^="blob:"]',
+                'div[role="dialog"] video[src^="blob:"]',
+                'div[role="dialog"] canvas',
+                'footer img[src^="blob:"]',
+                'footer video[src^="blob:"]',
+                'footer canvas'
             ];
 
             const INVALID_PATTERNS = [
@@ -13494,6 +18984,12 @@ class LockedBrowser(QMainWindow):
                 }}
             }}
 
+            function isElementVisible(element) {{
+                if (!element) return false;
+                const rect = element.getBoundingClientRect();
+                return rect.width >= 8 && rect.height >= 8;
+            }}
+
             function findComposeBox() {{
                 for (const sel of COMPOSE_SELECTORS) {{
                     const candidates = Array.from(document.querySelectorAll(sel));
@@ -13516,6 +19012,17 @@ class LockedBrowser(QMainWindow):
                         if (rect.width < 80 || rect.height < 20) continue;
 
                         return el;
+                    }}
+                }}
+                return null;
+            }}
+
+            function findMediaCaptionBox() {{
+                for (const sel of MEDIA_CAPTION_SELECTORS) {{
+                    const nodes = Array.from(document.querySelectorAll(sel));
+                    for (const node of nodes) {{
+                        if (!isElementVisible(node)) continue;
+                        return node;
                     }}
                 }}
                 return null;
@@ -13597,12 +19104,55 @@ class LockedBrowser(QMainWindow):
                 }});
             }}
 
+            function hasAttachmentPreview() {{
+                for (const sel of ATTACHMENT_PREVIEW_SELECTORS) {{
+                    const nodes = Array.from(document.querySelectorAll(sel));
+                    for (const node of nodes) {{
+                        if (isElementVisible(node)) return true;
+                    }}
+                }}
+                return false;
+            }}
+
             async function waitForSelectedAttachment(timeoutMs) {{
                 const startedAt = Date.now();
                 while ((Date.now() - startedAt) < timeoutMs) {{
-                    if (hasSelectedAttachment()) return true;
+                    if (hasSelectedAttachment() || hasAttachmentPreview()) return true;
                     await new Promise(r => setTimeout(r, 250));
                 }}
+                return false;
+            }}
+
+            async function waitForMediaCaptionBox(timeoutMs) {{
+                const startedAt = Date.now();
+                while ((Date.now() - startedAt) < timeoutMs) {{
+                    const captionBox = findMediaCaptionBox();
+                    if (captionBox) return captionBox;
+                    await new Promise(r => setTimeout(r, 250));
+                }}
+                return null;
+            }}
+
+            function triggerFileChooser(fileInput) {{
+                if (!fileInput) return false;
+                try {{
+                    fileInput.focus?.();
+                }} catch (e) {{}}
+
+                try {{
+                    fileInput.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true, cancelable: true }}));
+                }} catch (e) {{}}
+                try {{
+                    fileInput.click();
+                    return true;
+                }} catch (e) {{}}
+                try {{
+                    fileInput.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true, cancelable: true }}));
+                }} catch (e) {{}}
+                try {{
+                    fileInput.dispatchEvent(new MouseEvent('click', {{ bubbles: true, cancelable: true }}));
+                    return true;
+                }} catch (e) {{}}
                 return false;
             }}
 
@@ -13616,43 +19166,53 @@ class LockedBrowser(QMainWindow):
                 return null;
             }}
 
-            async function uploadAndSendAttachmentOnly() {{
+            async function uploadAttachmentWithOptionalCaption(messageText) {{
+                const attachButton = findAttachButton();
+                if (attachButton) {{
+                    clickElement(attachButton);
+                    await new Promise(r => setTimeout(r, 700));
+                }}
+
                 let fileInput = findBestImageFileInput();
+                if (!fileInput && attachButton) {{
+                    clickElement(attachButton);
+                    await new Promise(r => setTimeout(r, 700));
+                    fileInput = findBestImageFileInput();
+                }}
+
                 if (!fileInput) {{
-                    const attachButton = findAttachButton();
-                    if (attachButton) {{
-                        clickElement(attachButton);
-                        await new Promise(r => setTimeout(r, 700));
-                        fileInput = findBestImageFileInput();
+                    return {{ ok: false, error: 'attachment_input_not_found', usedCaption: false }};
+                }}
+
+                if (!hasSelectedAttachment() && !hasAttachmentPreview()) {{
+                    triggerFileChooser(fileInput);
+                }}
+
+                const selected = await waitForSelectedAttachment(12000);
+                if (!selected) {{
+                    return {{ ok: false, error: 'attachment_not_selected', usedCaption: false }};
+                }}
+
+                await new Promise(r => setTimeout(r, 1600));
+
+                let usedCaption = false;
+                if (messageText) {{
+                    const captionBox = findMediaCaptionBox() || await waitForMediaCaptionBox(3500);
+                    if (captionBox) {{
+                        insertMessagePreserveLines(captionBox, messageText);
+                        await new Promise(r => setTimeout(r, 900));
+                        usedCaption = true;
                     }}
                 }}
 
-                if (!fileInput) {{
-                    return {{ ok: false, error: 'attachment_input_not_found' }};
-                }}
-
-                try {{
-                    fileInput.click();
-                }} catch (e) {{
-                    try {{
-                        fileInput.dispatchEvent(new MouseEvent('click', {{ bubbles: true, cancelable: true }}));
-                    }} catch (err) {{}}
-                }}
-
-                const selected = await waitForSelectedAttachment(10000);
-                if (!selected) {{
-                    return {{ ok: false, error: 'attachment_not_selected' }};
-                }}
-
-                await new Promise(r => setTimeout(r, 1400));
                 const sendButton = findSendButton();
                 if (!sendButton) {{
-                    return {{ ok: false, error: 'attachment_send_button_not_found' }};
+                    return {{ ok: false, error: 'attachment_send_button_not_found', usedCaption: usedCaption }};
                 }}
 
                 clickElement(sendButton);
-                await new Promise(r => setTimeout(r, 1800));
-                return {{ ok: true, error: null }};
+                await new Promise(r => setTimeout(r, 2200));
+                return {{ ok: true, error: null, usedCaption: usedCaption }};
             }}
 
             function insertMessagePreserveLines(composeBox, text) {{
@@ -13757,15 +19317,17 @@ class LockedBrowser(QMainWindow):
                     return {{ ok: false, error: 'compose_box_timeout' }};
                 }}
 
+                let attachmentUsedCaption = false;
                 if (TARGET_ATTACHMENT) {{
-                    const attachmentResult = await uploadAndSendAttachmentOnly();
+                    const attachmentResult = await uploadAttachmentWithOptionalCaption(TARGET_MESSAGE);
                     if (!attachmentResult.ok) {{
                         return attachmentResult;
                     }}
+                    attachmentUsedCaption = !!attachmentResult.usedCaption;
                     composeBox = null;
                 }}
 
-                if (!TARGET_MESSAGE) {{
+                if (!TARGET_MESSAGE || attachmentUsedCaption) {{
                     return {{ ok: true, error: null }};
                 }}
 
@@ -14225,7 +19787,9 @@ class LockedBrowser(QMainWindow):
             "profile": profile,
             "account_id": account_id,
             "wa_self_number": "",
-            "wa_self_display": ""
+            "wa_self_display": "",
+            "wa_has_qr": False,
+            "wa_logged_in": False,
         })
 
         if config["name"] == "WhatsApp":
@@ -14347,6 +19911,10 @@ class LockedBrowser(QMainWindow):
         self._refresh_tab_close_buttons()
 
         if tab_meta and tab_meta["name"] == "WhatsApp":
+            self._drop_qc_whatsapp_jobs_for_account(
+                tab_meta.get("account_id"),
+                reason="tab_closed"
+            )
             self.save_whatsapp_tabs_state()
 
 
@@ -14379,6 +19947,16 @@ class LockedBrowser(QMainWindow):
                 self,
                 "Cannot Close Tab",
                 f"{label} is currently running a WhatsApp history sync.\n\nPlease wait until it finishes."
+            )
+            return
+
+        if self._has_qc_whatsapp_active_job(view=widget):
+            active = self._qc_whatsapp_active or {}
+            label = self._format_whatsapp_label(active.get("account_id"))
+            QMessageBox.information(
+                self,
+                "Cannot Close Tab",
+                f"{label} is currently borrowed by bot for QC WhatsApp forwarding.\n\nPlease wait until it finishes."
             )
             return
 
@@ -14847,6 +20425,10 @@ class LockedBrowser(QMainWindow):
                 return !!(window.__waAutoSendState && window.__waAutoSendState.status === "running");
             }
 
+            function isQcSenderMode() {
+                return !!window.__ptnQcSenderMode;
+            }
+
             function matchesSendButton(target) {
                 if (!target) return false;
                 for (const sel of SEND_BUTTON_SELECTORS) {
@@ -14893,7 +20475,7 @@ class LockedBrowser(QMainWindow):
             }
 
             function queueManualSendLog(trigger) {
-                if (isBulkRunning()) return;
+                if (isBulkRunning() || isQcSenderMode()) return;
 
                 const composeBox = findComposeBox();
                 if (!composeBox) return;
@@ -15291,6 +20873,8 @@ class LockedBrowser(QMainWindow):
 
         current = url.toString()
         if not host_allowed(current, tab["allowed_sites"]):
+            if tab.get("name") == "WhatsApp" and url.scheme().lower() in ("http", "https"):
+                self.show_blocked_external_url_notice("WhatsApp", current)
             # safety fallback only
             if tab.get("is_fixed"):
                 view.setUrl(QUrl(tab["home"]))
@@ -15384,7 +20968,6 @@ class LockedBrowser(QMainWindow):
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Bad Word Daily Counter")
-        dlg.setGeometry(240, 240, 1180, 720)
 
         layout = QVBoxLayout(dlg)
 
@@ -15431,31 +21014,32 @@ class LockedBrowser(QMainWindow):
         def render():
             days = load_bad_word_counter().get("days", {})
             rows = sorted(days.items(), key=lambda x: x[0], reverse=True)
-            day_table.setRowCount(len(rows))
+            with table_update_batch(day_table):
+                day_table.setRowCount(len(rows))
 
-            for row_index, (day, bucket) in enumerate(rows):
-                by_word = dict(bucket.get("by_word", {}))
-                by_source = dict(bucket.get("by_source", {}))
-                by_sender = dict(bucket.get("by_sender", {}))
-                by_receiver = dict(bucket.get("by_receiver", {}))
+                for row_index, (day, bucket) in enumerate(rows):
+                    by_word = dict(bucket.get("by_word", {}))
+                    by_source = dict(bucket.get("by_source", {}))
+                    by_sender = dict(bucket.get("by_sender", {}))
+                    by_receiver = dict(bucket.get("by_receiver", {}))
 
-                top_words = sorted(by_word.items(), key=lambda x: x[1], reverse=True)[:5]
-                top_sources = sorted(by_source.items(), key=lambda x: x[1], reverse=True)[:5]
-                top_senders = sorted(by_sender.items(), key=lambda x: x[1], reverse=True)[:5]
-                top_receivers = sorted(by_receiver.items(), key=lambda x: x[1], reverse=True)[:5]
+                    top_words = sorted(by_word.items(), key=lambda x: x[1], reverse=True)[:5]
+                    top_sources = sorted(by_source.items(), key=lambda x: x[1], reverse=True)[:5]
+                    top_senders = sorted(by_sender.items(), key=lambda x: x[1], reverse=True)[:5]
+                    top_receivers = sorted(by_receiver.items(), key=lambda x: x[1], reverse=True)[:5]
 
-                top_words_text = ", ".join(f"{w}({c})" for w, c in top_words) if top_words else "-"
-                top_sources_text = ", ".join(f"{src}({c})" for src, c in top_sources) if top_sources else "-"
-                top_senders_text = ", ".join(f"{src}({c})" for src, c in top_senders) if top_senders else "-"
-                top_receivers_text = ", ".join(f"{dst}({c})" for dst, c in top_receivers) if top_receivers else "-"
+                    top_words_text = ", ".join(f"{w}({c})" for w, c in top_words) if top_words else "-"
+                    top_sources_text = ", ".join(f"{src}({c})" for src, c in top_sources) if top_sources else "-"
+                    top_senders_text = ", ".join(f"{src}({c})" for src, c in top_senders) if top_senders else "-"
+                    top_receivers_text = ", ".join(f"{dst}({c})" for dst, c in top_receivers) if top_receivers else "-"
 
-                day_table.setItem(row_index, 0, make_table_item(day, user_data=day))
-                day_table.setItem(row_index, 1, make_table_item(str(bucket.get("total_hits", 0))))
-                day_table.setItem(row_index, 2, make_table_item(str(bucket.get("events", 0))))
-                day_table.setItem(row_index, 3, make_table_item(top_words_text))
-                day_table.setItem(row_index, 4, make_table_item(top_sources_text))
-                day_table.setItem(row_index, 5, make_table_item(top_senders_text))
-                day_table.setItem(row_index, 6, make_table_item(top_receivers_text))
+                    day_table.setItem(row_index, 0, make_table_item(day, user_data=day))
+                    day_table.setItem(row_index, 1, make_table_item(str(bucket.get("total_hits", 0))))
+                    day_table.setItem(row_index, 2, make_table_item(str(bucket.get("events", 0))))
+                    day_table.setItem(row_index, 3, make_table_item(top_words_text))
+                    day_table.setItem(row_index, 4, make_table_item(top_sources_text))
+                    day_table.setItem(row_index, 5, make_table_item(top_senders_text))
+                    day_table.setItem(row_index, 6, make_table_item(top_receivers_text))
 
             if day_table.rowCount() > 0:
                 select_first_table_row(day_table)
@@ -15478,6 +21062,14 @@ class LockedBrowser(QMainWindow):
         day_table.itemSelectionChanged.connect(update_detail)
         refresh_btn.clicked.connect(render)
         close_btn.clicked.connect(dlg.accept)
+
+        apply_screen_friendly_window_size(
+            dlg,
+            1180,
+            720,
+            min_width=880,
+            min_height=560
+        )
 
         render()
         dlg.exec()
@@ -15618,7 +21210,6 @@ class LockedBrowser(QMainWindow):
 
         dlg = QDialog(self)
         dlg.setWindowTitle(title)
-        dlg.setGeometry(230, 180, 1500, 820)
 
         layout = QVBoxLayout(dlg)
 
@@ -15701,31 +21292,32 @@ class LockedBrowser(QMainWindow):
             nonlocal visible_summaries
             query = str(search_edit.text() or "").strip().lower()
             visible_summaries = []
-            contact_table.setRowCount(0)
+            with table_update_batch(contact_table):
+                contact_table.setRowCount(0)
 
-            for summary in base_summaries:
-                haystack = " ".join([
-                    str(summary.get("contact_display") or ""),
-                    str(summary.get("contact_phone") or ""),
-                    str(summary.get("contact_key") or "")
-                ]).lower()
-                if query and query not in haystack:
-                    continue
+                for summary in base_summaries:
+                    haystack = " ".join([
+                        str(summary.get("contact_display") or ""),
+                        str(summary.get("contact_phone") or ""),
+                        str(summary.get("contact_key") or "")
+                    ]).lower()
+                    if query and query not in haystack:
+                        continue
 
-                visible_summaries.append(summary)
-            contact_table.setRowCount(len(visible_summaries))
-            for row_index, summary in enumerate(visible_summaries):
-                row_values = [
-                    str(summary.get("contact_display") or summary.get("contact_key") or "-"),
-                    str(int(summary.get("sent_count") or 0)),
-                    str(int(summary.get("received_count") or 0)),
-                    format_user_datetime_text(summary.get("first_timestamp"), default="-"),
-                    format_user_datetime_text(summary.get("last_timestamp"), default="-"),
-                    summary.get("self_accounts_text") or "-"
-                ]
-                for col, value in enumerate(row_values):
-                    user_data = summary.get("contact_key") if col == 0 else None
-                    contact_table.setItem(row_index, col, make_table_item(value, user_data=user_data))
+                    visible_summaries.append(summary)
+                contact_table.setRowCount(len(visible_summaries))
+                for row_index, summary in enumerate(visible_summaries):
+                    row_values = [
+                        str(summary.get("contact_display") or summary.get("contact_key") or "-"),
+                        str(int(summary.get("sent_count") or 0)),
+                        str(int(summary.get("received_count") or 0)),
+                        format_user_datetime_text(summary.get("first_timestamp"), default="-"),
+                        format_user_datetime_text(summary.get("last_timestamp"), default="-"),
+                        summary.get("self_accounts_text") or "-"
+                    ]
+                    for col, value in enumerate(row_values):
+                        user_data = summary.get("contact_key") if col == 0 else None
+                        contact_table.setItem(row_index, col, make_table_item(value, user_data=user_data))
 
             if contact_table.rowCount() > 0:
                 select_first_table_row(contact_table)
@@ -15737,53 +21329,54 @@ class LockedBrowser(QMainWindow):
             nonlocal current_message_rows
             row_index = contact_table.currentRow()
             current_message_rows = []
-            message_table.setRowCount(0)
+            with table_update_batch(message_table):
+                message_table.setRowCount(0)
 
-            if row_index < 0:
-                detail_box.clear()
-                return
+                if row_index < 0:
+                    detail_box.clear()
+                    return
 
-            current_item = contact_table.item(row_index, 0)
-            target_key = str(current_item.data(Qt.ItemDataRole.UserRole) or "").strip() if current_item else ""
-            summary = next((item for item in visible_summaries if str(item.get("contact_key")) == target_key), None)
-            if not summary:
-                detail_box.clear()
-                return
+                current_item = contact_table.item(row_index, 0)
+                target_key = str(current_item.data(Qt.ItemDataRole.UserRole) or "").strip() if current_item else ""
+                summary = next((item for item in visible_summaries if str(item.get("contact_key")) == target_key), None)
+                if not summary:
+                    detail_box.clear()
+                    return
 
-            mode = direction_combo.currentData()
-            for row in summary.get("rows") or []:
-                if mode != "all" and row.get("direction") != mode:
-                    continue
-                current_message_rows.append(row)
+                mode = direction_combo.currentData()
+                for row in summary.get("rows") or []:
+                    if mode != "all" and row.get("direction") != mode:
+                        continue
+                    current_message_rows.append(row)
 
-            message_table.setRowCount(len(current_message_rows))
-            for message_index, row in enumerate(current_message_rows):
-                send_type = str(row.get("send_type") or "")
-                if send_type == "sync_incoming":
-                    direction_text = "SYNC IN"
-                elif send_type == "incoming_reply":
-                    direction_text = "IN"
-                elif send_type == "sync_outgoing":
-                    direction_text = "SYNC OUT"
-                elif send_type == "bulk_auto":
-                    direction_text = "BULK"
-                else:
-                    direction_text = "OUT"
+                message_table.setRowCount(len(current_message_rows))
+                for message_index, row in enumerate(current_message_rows):
+                    send_type = str(row.get("send_type") or "")
+                    if send_type == "sync_incoming":
+                        direction_text = "SYNC IN"
+                    elif send_type == "incoming_reply":
+                        direction_text = "IN"
+                    elif send_type == "sync_outgoing":
+                        direction_text = "SYNC OUT"
+                    elif send_type == "bulk_auto":
+                        direction_text = "BULK"
+                    else:
+                        direction_text = "OUT"
 
-                row_values = [
-                    row.get("timestamp_display") or "-",
-                    direction_text,
-                    row.get("from_text") or "-",
-                    row.get("to_text") or "-",
-                    row.get("preview") or "-",
-                    str(row.get("status") or "-").upper(),
-                    str(row.get("trigger") or "-"),
-                    send_type or "-",
-                    str(int(row.get("bad_word_count") or 0))
-                ]
-                for col, value in enumerate(row_values):
-                    user_data = row if col == 0 else None
-                    message_table.setItem(message_index, col, make_table_item(value, user_data=user_data))
+                    row_values = [
+                        row.get("timestamp_display") or "-",
+                        direction_text,
+                        row.get("from_text") or "-",
+                        row.get("to_text") or "-",
+                        row.get("preview") or "-",
+                        str(row.get("status") or "-").upper(),
+                        str(row.get("trigger") or "-"),
+                        send_type or "-",
+                        str(int(row.get("bad_word_count") or 0))
+                    ]
+                    for col, value in enumerate(row_values):
+                        user_data = row if col == 0 else None
+                        message_table.setItem(message_index, col, make_table_item(value, user_data=user_data))
 
             if message_table.rowCount() > 0:
                 message_table.setCurrentCell(message_table.rowCount() - 1, 0)
@@ -15827,6 +21420,16 @@ class LockedBrowser(QMainWindow):
         export_btn.clicked.connect(export_current_conversation)
         close_btn.clicked.connect(dlg.accept)
 
+        apply_screen_friendly_window_size(
+            dlg,
+            1500,
+            820,
+            min_width=980,
+            min_height=620,
+            width_ratio=0.94,
+            height_ratio=0.90
+        )
+
         render_contacts()
         dlg.exec()
 
@@ -15854,6 +21457,7 @@ class LockedBrowser(QMainWindow):
         tools_menu.addAction("View Network Log", self.show_network_log)
         tools_menu.addAction("View Manual Send Log", self.show_manual_send_log)
         tools_menu.addAction("Clear Manual Send Log", self.clear_manual_send_log)
+        tools_menu.addAction("Clear Previous Blast List", self.clear_previous_blast_list)
         tools_menu.addAction("Clear Histories", self.clear_histories_no_password)
         tools_menu.addSeparator()
 
@@ -15861,8 +21465,11 @@ class LockedBrowser(QMainWindow):
         tools_menu.addAction("Detected API Tables", self.open_detected_api_picker)
         tools_menu.addAction("Manage Contacts", self.open_contact_manager)
         tools_menu.addAction("Reply With Template", self.open_whatsapp_template_reply)
-        tools_menu.addAction("Sync WhatsApp Histories", self.sync_whatsapp_histories)
+        sync_action = tools_menu.addAction("Sync WhatsApp Histories (Coming Soon)")
+        sync_action.setEnabled(False)
         tools_menu.addAction("Set Proxy", self.set_custom_proxy)
+        tools_menu.addAction("Set QC Notification Emails", self.configure_qc_notification_emails)
+        tools_menu.addAction("Set QC WhatsApp Numbers", self.configure_qc_whatsapp_numbers)
         tools_menu.addAction("View Bad Word Stats", self.show_bad_word_stats)
         tools_menu.addAction("Manage Templates", self.open_template_manager)
         tools_menu.addAction("Set Bulk Message Mode", self.configure_custom_bulk_message_policy)
@@ -15884,11 +21491,6 @@ class LockedBrowser(QMainWindow):
         bulk_btn.clicked.connect(self.bulk_whatsapp_send)
         bulk_btn.setMinimumWidth(104)
         bar.addWidget(bulk_btn)
-
-        sync_btn = QPushButton("Sync Histories")
-        sync_btn.clicked.connect(self.sync_whatsapp_histories)
-        sync_btn.setMinimumWidth(120)
-        bar.addWidget(sync_btn)
 
         reply_template_btn = QPushButton("Reply Template")
         reply_template_btn.clicked.connect(self.open_whatsapp_template_reply)
@@ -16081,28 +21683,106 @@ class LockedBrowser(QMainWindow):
     def show_tray_message(self, title, message):
         self.tray_icon.showMessage(title, message, QSystemTrayIcon.MessageIcon.Information, 3000)
 
+    def show_blocked_external_url_notice(self, tab_name, url_text):
+        url_text = str(url_text or "").strip()
+        if not url_text:
+            return
+
+        now_mono = time.monotonic()
+        last_notice = dict(getattr(self, "_blocked_external_notice", {}) or {})
+        if (
+            str(last_notice.get("url") or "") == url_text and
+            (now_mono - float(last_notice.get("mono") or 0.0)) < 1.5
+        ):
+            return
+
+        self._blocked_external_notice = {
+            "url": url_text,
+            "mono": now_mono
+        }
+
+        copied = False
+        try:
+            clipboard = QApplication.clipboard()
+            if clipboard is not None:
+                clipboard.setText(url_text)
+                copied = True
+        except Exception:
+            copied = False
+
+        self.status_bar.showMessage(
+            "External link blocked. Copy and paste it into your normal browser.",
+            5000
+        )
+
+        extra_line = "\n\nThe URL has been copied to your clipboard." if copied else ""
+        QMessageBox.information(
+            self,
+            "External Link Blocked",
+            f"This URL cannot be opened inside {tab_name}.\n\n"
+            f"Please copy and paste it into your normal browser.\n\n"
+            f"URL:\n{url_text}{extra_line}"
+        )
+
     # ---------- Disclaimer ----------
     def show_startup_disclaimer(self):
+        auto_close_seconds = 6
+        disclaimer_text = (
+            "This application is made by Yusuf Adisaputro for PT Pendanaan Teknologi Nusa (\"the Company\").\n\n"
+            "By accessing or using this application, you acknowledge and agree that:\n"
+            "• All activities performed within this browser interface are subject to real-time logging, "
+            "monitoring, and recording by the Company or its authorized agents.\n"
+            "• The Company reserves the right to audit, review, and retain all records of your interactions "
+            "for security, compliance, and operational purposes.\n"
+            "• Any unauthorized access, attempted tampering, malicious acts (including but not limited to "
+            "introducing malware, exploiting vulnerabilities, or exceeding authorized usage), or violation "
+            "of applicable laws, regulations, or the Company’s policies will constitute a material breach.\n"
+            "• Such breach may result in immediate termination of access, civil liability, criminal prosecution, "
+            "and any other remedies available under the laws of the Republic of Indonesia or other relevant jurisdictions.\n\n"
+            "By continuing to use this application, you expressly consent to the terms set forth above. "
+            f"You will be automatically redirected to the intended target site(s) in {auto_close_seconds} seconds."
+        )
+
         dlg = QDialog(self, Qt.WindowType.WindowStaysOnTopHint)
         dlg.setWindowTitle("Disclaimer")
         dlg.setModal(True)
-        dlg.setFixedSize(500, 200)
 
         layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
 
-        message = QLabel(
-            "This application is made by PT Pendanaan Teknologi Nusa.\n\n"
-            "All actions performed within this browser are recorded and monitored.\n"
-            "Any malicious activities will be subject to legal liability and may be prosecuted.\n\n"
-            "You will be redirected to the target sites in 3 seconds."
+        title = QLabel("Company Monitoring Notice", dlg)
+        title.setStyleSheet("font-size: 16px; font-weight: 700; color: #0d2d63;")
+        layout.addWidget(title)
+
+        message = QTextBrowser(dlg)
+        message.setReadOnly(True)
+        message.setOpenExternalLinks(False)
+        message.setFrameShape(QFrame.Shape.StyledPanel)
+        message.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        message.setPlainText(disclaimer_text)
+        layout.addWidget(message, 1)
+
+        footer = QLabel(
+            f"This window will close automatically in {auto_close_seconds} seconds.",
+            dlg
         )
-        message.setWordWrap(True)
-        layout.addWidget(message)
+        footer.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        footer.setStyleSheet("color: #4a5f7d;")
+        layout.addWidget(footer)
 
         self.disclaimer_timer = QTimer()
         self.disclaimer_timer.setSingleShot(True)
         self.disclaimer_timer.timeout.connect(dlg.accept)
-        self.disclaimer_timer.start(3000)
+        self.disclaimer_timer.start(auto_close_seconds * 1000)
+
+        apply_screen_friendly_window_size(
+            dlg,
+            780,
+            460,
+            min_width=620,
+            min_height=360
+        )
 
         dlg.exec()
 
@@ -16111,33 +21791,102 @@ class LockedBrowser(QMainWindow):
 
     # ---------- Download handling ----------
     def handle_download(self, download):
-        url = download.url().toString()
-        path = download.url().path()
-        ext = os.path.splitext(path)[1].lower()
-        if ext in ALLOWED_DOWNLOAD_EXTENSIONS:
-            downloads_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
-            if not os.path.exists(downloads_dir):
-                os.makedirs(downloads_dir)
-            base_name = os.path.basename(path)
-            if not base_name:
-                base_name = f"download{ext}"
-            file_path = os.path.join(downloads_dir, base_name)
-            counter = 1
-            orig_path = file_path
-            while os.path.exists(file_path):
-                name, ext = os.path.splitext(orig_path)
-                file_path = f"{name}_{counter}{ext}"
-                counter += 1
+        def _safe_cancel():
+            try:
+                download.cancel()
+            except Exception:
+                pass
 
-            download.setPath(file_path)
-            download.accept()
-            self.status_bar.showMessage(f"Downloading {base_name}...", 3000)
-            self.show_tray_message("Download started", base_name)
-        else:
-            download.cancel()
-            QMessageBox.warning(self, "Download Blocked",
-                                f"Files of type {ext} are not allowed.\nAllowed: {', '.join(ALLOWED_DOWNLOAD_EXTENSIONS)}")
-            self.status_bar.showMessage(f"Blocked download: {ext} not allowed", 3000)
+        try:
+            path = ""
+            url_text = ""
+            try:
+                path = download.url().path()
+            except Exception:
+                path = ""
+            try:
+                url_text = download.url().toString()
+            except Exception:
+                url_text = ""
+
+            suggested_name = ""
+            for getter_name in ("suggestedFileName", "downloadFileName"):
+                getter = getattr(download, getter_name, None)
+                if not callable(getter):
+                    continue
+                try:
+                    suggested_name = str(getter() or "").strip()
+                except Exception:
+                    suggested_name = ""
+                if suggested_name:
+                    break
+
+            mime_type = ""
+            get_mime = getattr(download, "mimeType", None)
+            if callable(get_mime):
+                try:
+                    mime_type = str(get_mime() or "").strip()
+                except Exception:
+                    mime_type = ""
+
+            candidate_name = suggested_name or os.path.basename(path)
+            ext = infer_download_extension(
+                candidate_name=candidate_name,
+                mime_type=mime_type,
+                path=path,
+                url_text=url_text
+            )
+
+            if is_allowed_download_target(ext=ext, mime_type=mime_type):
+                downloads_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+                if not downloads_dir:
+                    downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+                if not os.path.exists(downloads_dir):
+                    os.makedirs(downloads_dir, exist_ok=True)
+
+                base_name = candidate_name
+                if not base_name:
+                    base_name = f"download{ext}"
+                elif not os.path.splitext(base_name)[1] and ext:
+                    base_name = f"{base_name}{ext}"
+
+                file_path = os.path.join(downloads_dir, base_name)
+                counter = 1
+                orig_path = file_path
+                while os.path.exists(file_path):
+                    name, current_ext = os.path.splitext(orig_path)
+                    file_path = f"{name}_{counter}{current_ext}"
+                    counter += 1
+
+                set_directory = getattr(download, "setDownloadDirectory", None)
+                set_filename = getattr(download, "setDownloadFileName", None)
+                set_path = getattr(download, "setPath", None)
+
+                if callable(set_directory) and callable(set_filename):
+                    set_directory(os.path.dirname(file_path))
+                    set_filename(os.path.basename(file_path))
+                elif callable(set_path):
+                    set_path(file_path)
+                else:
+                    raise AttributeError("Download destination setter is not available on this Qt build")
+
+                download.accept()
+                self.status_bar.showMessage(f"Downloading {base_name}...", 3000)
+                self.show_tray_message("Download started", base_name)
+            else:
+                _safe_cancel()
+                ext_text = ext or normalize_download_mime(mime_type) or "(unknown)"
+                QMessageBox.warning(
+                    self,
+                    "Download Blocked",
+                    f"Files of type {ext_text} are not allowed.\nAllowed: {', '.join(sorted(ALLOWED_DOWNLOAD_EXTENSIONS))}"
+                )
+                self.status_bar.showMessage(f"Blocked download: {ext_text} not allowed", 3000)
+        except Exception as exc:
+            _safe_cancel()
+            error_text = str(exc) or exc.__class__.__name__
+            QMessageBox.warning(self, "Download Error", f"Could not start the download.\n{error_text}")
+            self.status_bar.showMessage("Download failed to start", 3000)
 
     def clear_manual_send_log(self):
         if not self.require_admin_password():
@@ -16155,7 +21904,27 @@ class LockedBrowser(QMainWindow):
 
         clear_manual_send_log_file()
         QMessageBox.information(self, "Cleared", "Manual send log cleared.")
-    
+
+    def clear_previous_blast_list(self):
+        if not self.require_admin_password():
+            QMessageBox.warning(self, "Error", "Incorrect password.")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Clear Previous Blast List",
+            "Clear the saved previous blast recipient list, message, and attachment reference?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            clear_last_blast_file()
+            QMessageBox.information(self, "Cleared", "Previous blast list cleared.")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to clear previous blast list:\n{e}")
+
     # ---------- History and Admin ----------
     def show_history(self):
         if not self.require_admin_password():
@@ -16165,7 +21934,6 @@ class LockedBrowser(QMainWindow):
         hist = load_history()
         dlg = QDialog(self)
         dlg.setWindowTitle("Full History")
-        dlg.setGeometry(200, 200, 900, 600)
         layout = QVBoxLayout(dlg)
 
         text = QTextEdit()
@@ -16177,6 +21945,14 @@ class LockedBrowser(QMainWindow):
         close_btn.clicked.connect(dlg.accept)
         layout.addWidget(close_btn)
 
+        apply_screen_friendly_window_size(
+            dlg,
+            900,
+            600,
+            min_width=700,
+            min_height=460
+        )
+
         dlg.exec()
 
 
@@ -16187,7 +21963,6 @@ class LockedBrowser(QMainWindow):
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Network Log")
-        dlg.setGeometry(200, 200, 1200, 800)
 
         layout = QVBoxLayout(dlg)
 
@@ -16237,6 +22012,14 @@ class LockedBrowser(QMainWindow):
         proxied_only_chk.toggled.connect(render)
         refresh_btn.clicked.connect(render)
 
+        apply_screen_friendly_window_size(
+            dlg,
+            1200,
+            800,
+            min_width=860,
+            min_height=560
+        )
+
         render()
         dlg.exec()
 
@@ -16247,7 +22030,6 @@ class LockedBrowser(QMainWindow):
 
         dlg = QDialog(self)
         dlg.setWindowTitle("WhatsApp History Log")
-        dlg.setGeometry(220, 220, 1350, 780)
 
         layout = QVBoxLayout(dlg)
 
@@ -16346,35 +22128,36 @@ class LockedBrowser(QMainWindow):
             filtered.sort(key=lambda row: (row.get("sort_key"), row.get("index", 0)), reverse=True)
             current_rows = filtered
 
-            log_table.setRowCount(len(current_rows))
-            for row_index, row in enumerate(current_rows):
-                send_type = str(row.get("send_type") or "").strip().lower()
-                if send_type == "sync_incoming":
-                    direction_text = "SYNC IN"
-                elif send_type == "incoming_reply":
-                    direction_text = "IN"
-                elif send_type == "sync_outgoing":
-                    direction_text = "SYNC OUT"
-                elif send_type == "bulk_auto":
-                    direction_text = "BULK"
-                else:
-                    direction_text = "OUT"
+            with table_update_batch(log_table):
+                log_table.setRowCount(len(current_rows))
+                for row_index, row in enumerate(current_rows):
+                    send_type = str(row.get("send_type") or "").strip().lower()
+                    if send_type == "sync_incoming":
+                        direction_text = "SYNC IN"
+                    elif send_type == "incoming_reply":
+                        direction_text = "IN"
+                    elif send_type == "sync_outgoing":
+                        direction_text = "SYNC OUT"
+                    elif send_type == "bulk_auto":
+                        direction_text = "BULK"
+                    else:
+                        direction_text = "OUT"
 
-                row_values = [
-                    row.get("timestamp_display") or "-",
-                    direction_text,
-                    row.get("from_text") or "-",
-                    row.get("to_text") or "-",
-                    row.get("preview") or "-",
-                    str(row.get("status") or "-").upper(),
-                    str(row.get("trigger") or "-"),
-                    send_type or "-",
-                    str(int(row.get("bad_word_count") or 0)),
-                    row.get("reply_speed_hms") or "-"
-                ]
-                for col, value in enumerate(row_values):
-                    user_data = row if col == 0 else None
-                    log_table.setItem(row_index, col, make_table_item(value, user_data=user_data))
+                    row_values = [
+                        row.get("timestamp_display") or "-",
+                        direction_text,
+                        row.get("from_text") or "-",
+                        row.get("to_text") or "-",
+                        row.get("preview") or "-",
+                        str(row.get("status") or "-").upper(),
+                        str(row.get("trigger") or "-"),
+                        send_type or "-",
+                        str(int(row.get("bad_word_count") or 0)),
+                        row.get("reply_speed_hms") or "-"
+                    ]
+                    for col, value in enumerate(row_values):
+                        user_data = row if col == 0 else None
+                        log_table.setItem(row_index, col, make_table_item(value, user_data=user_data))
 
             if log_table.rowCount() > 0:
                 select_first_table_row(log_table)
@@ -16405,6 +22188,16 @@ class LockedBrowser(QMainWindow):
         close_btn.clicked.connect(dlg.accept)
         filter_combo.currentIndexChanged.connect(render)
 
+        apply_screen_friendly_window_size(
+            dlg,
+            1350,
+            780,
+            min_width=920,
+            min_height=580,
+            width_ratio=0.94,
+            height_ratio=0.90
+        )
+
         render()
         dlg.exec()
 
@@ -16422,14 +22215,7 @@ class LockedBrowser(QMainWindow):
             with open(NETWORK_LOG_FILE, "wb") as f:
                 f.write(encrypt_data([]))
 
-            with open(LAST_BLAST_FILE, "wb") as f:
-                f.write(encrypt_data({
-                    "recipients": [],
-                    "numbers": [],
-                    "message": "",
-                    "attachment_path": "",
-                    "updated_at": ""
-                }))
+            clear_last_blast_file()
 
             with open(MANUAL_SEND_LOG_FILE, "wb") as f:
                 f.write(encrypt_data([]))
@@ -16451,7 +22237,6 @@ class ApiPickerDialog(QDialog):
     def __init__(self, apis, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Detected Collection APIs")
-        self.setGeometry(200, 200, 1000, 500)
         self.selected_index = None
         self.apis = apis
 
@@ -16489,6 +22274,14 @@ class ApiPickerDialog(QDialog):
         btns.addWidget(open_btn)
         btns.addWidget(cancel_btn)
         layout.addLayout(btns)
+
+        apply_screen_friendly_window_size(
+            self,
+            1000,
+            500,
+            min_width=760,
+            min_height=420
+        )
 
     def accept_selection(self):
         row = self.api_table.currentRow()
